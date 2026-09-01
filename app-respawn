@@ -27,7 +27,7 @@ $stdout.sync = true
 
 # リリース時はこことタグ(注釈付き・v なしの数字のみ)と CHANGELOG.md を揃える。
 # Chrome 拡張でいう manifest.json の version にあたる。
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 # 外部コマンドの出力は必ずこれを通す。scrub は不正バイトが来ても落ちないようにするため。
 def utf8(str) = str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
@@ -194,6 +194,240 @@ def load_config
   JSON.parse(File.read(CONFIG_PATH))
 rescue JSON::ParserError => e
   die("設定ファイルが JSON として読めません (#{CONFIG_PATH}): #{e.message}")
+end
+
+# ---- 操作スペース(Space)の削減(--max-spaces) --------------------------------
+#
+# Space を作成/削除する公開 API は存在しない。非公開の SkyLight は Dock 経由でしか
+# 受け付けられず SIP の部分無効化が要るため、Mission Control の UI を叩く。
+# 各デスクトップのタイルが AXRemoveDesktop アクションを持っているので、
+# 座標計算やホバーの再現は不要で、これを直接呼べばよい。
+SPACES_PLIST = File.join(Dir.home, 'Library', 'Preferences', 'com.apple.spaces.plist')
+
+# plist の type。0 が通常のデスクトップで、4 はフルスクリーンのアプリ。
+# フルスクリーンのタイルも AXRemoveDesktop を持ってしまうので、アクションの有無では
+# 判別できない。閉じるとアプリのフルスクリーンが解除されるため type で必ず除外する。
+SPACE_TYPE_DESKTOP = 0
+
+# 通常デスクトップのタイル名。フルスクリーンはアプリ名になる。plist の type と突き合わせて、
+# 対応づけが正しいかを確かめる保険に使う(type だけを信じると、ずれた時に気づけない)。
+DESKTOP_TILE_NAME = /\A(?:デスクトップ|Desktop)\s*\d+\z/
+
+# Mission Control はアニメーションを伴う。間隔を詰めたり開閉を繰り返したりすると
+# WindowServer が詰まって画面が固まる(実際に 0.4 秒 + 毎回開き直しで固まった)。
+# 固定の待ちではなく「タイルが実際に減るまで待つ」ことで詰まりを防ぐ。UI が更新された
+# ことを見てから次を投げるので、アニメーションを追い越せない。
+SPACE_POLL_INTERVAL = 0.1        # 減ったかを見にいく間隔
+SPACE_REMOVE_TIMEOUT = 2.0       # ここまで待って減らなければ失敗とみなす
+SPACE_REMOVE_SETTLE = 0.2        # 減ったのを見てから次を投げるまでの余裕
+SPACE_OPEN_TIMEOUT = 6.0
+
+# Dock は plist の書き出しを遅延させる(実測 6.7 秒)。UI が先に変わるので、対応づけの前に
+# 追いつくのを待つ。待たないと、切断直後というこのツールが動く場面でほぼ必ず中断する。
+SPACE_LAYOUT_TIMEOUT = 15.0
+SPACE_LAYOUT_POLL = 0.5
+
+# ディスプレイごとの Space の type を、Mission Control の並び順で返す。
+def spaces_layout
+  out, _, st = Open3.capture3('plutil', '-convert', 'json', '-o', '-', SPACES_PLIST)
+  return nil unless st.success?
+
+  monitors = JSON.parse(utf8(out)).dig('SpacesDisplayConfiguration', 'Management Data', 'Monitors')
+  return nil unless monitors
+
+  # Space が 0 件の要素は過去に接続したモニターの残骸なので落とす。
+  monitors.map { |m| Array(m['Spaces']).map { |sp| sp['type'] } }.reject(&:empty?)
+rescue JSON::ParserError
+  nil
+end
+
+# [開いているか, エラー]。AppleScript 自体が失敗した時は nil を返し、「閉じている」と区別する。
+# UI スクリプティングは自動化(Apple Event)とは別に「アクセシビリティ」の許可が要る。
+# しかも launchd 配下では許可の主体が osascript 自身になるので、ここだけ落ちることがある。
+def mission_control_state
+  out, err, ok = osascript('tell application "System Events" to tell process "Dock" to return (count of groups)')
+  ok ? [out.to_i.positive?, nil] : [nil, utf8(err).strip]
+end
+
+def mission_control_open? = mission_control_state[0]
+
+# 既に開いている状態で open を投げるとトグルして閉じてしまうので、必ず状態を見てから開く。
+# 戻り値は [開けたか, 開けなかった理由]。
+def open_mission_control
+  state, err = mission_control_state
+  # 状態を読めないなら開いてはいけない。閉じる操作も同じ UI スクリプティングなので、
+  # 開くと閉じる手段がないまま Mission Control が出しっぱなしになる。
+  return [false, "状態を読めません — #{err}"] if state.nil?
+  return [true, nil] if state
+
+  Open3.capture3('open', '-a', 'Mission Control')
+  deadline = Time.now + SPACE_OPEN_TIMEOUT
+  sleep 0.3 until mission_control_open? || Time.now > deadline
+  mission_control_open? ? [true, nil] : [false, "#{SPACE_OPEN_TIMEOUT.round}秒待っても開きませんでした"]
+end
+
+def close_mission_control
+  return unless mission_control_open?
+
+  osascript('tell application "System Events" to key code 53')
+  sleep 0.5
+end
+
+TILE_NAMES_SCRIPT = <<~APPLESCRIPT
+  tell application "System Events"
+    tell process "Dock"
+      set out to ""
+      set disps to UI elements of group 1
+      repeat with i from 1 to count of disps
+        set acc to ""
+        repeat with t in UI elements of (list 1 of UI element 2 of (item i of disps))
+          set nm to ""
+          try
+            set nm to (name of t) as text
+          end try
+          set acc to acc & nm & tab
+        end repeat
+        set out to out & acc & linefeed
+      end repeat
+      return out
+    end tell
+  end tell
+APPLESCRIPT
+
+# ディスプレイごとのタイル名の配列。通常のデスクトップは "デスクトップN"、
+# フルスクリーンはアプリ名になる(ただし判別は plist の type で行う。名前は保険)。
+def space_tile_names
+  out, _, ok = osascript(TILE_NAMES_SCRIPT)
+  return nil unless ok
+
+  out.split("\n").map { |line| line.split("\t") }
+end
+
+# 1枚削除する。狙ったタイルかどうかを名前で照合してから消し、枚数が1つ減ったかを確認する。
+# 成否を plist で見てはいけない: Dock はファイルへの書き込みを遅延させるので、直後に読むと
+# 古い値が返る(UI が 2枚を示している時点でファイルは 4枚のままだった)。
+def remove_space_tile(display_no, tile_no, expected_name)
+  script = <<~APPLESCRIPT
+    tell application "System Events"
+      tell process "Dock"
+        set lst to list 1 of UI element 2 of (UI element #{display_no} of group 1)
+        set t to UI element #{tile_no} of lst
+        set nm to ""
+        try
+          set nm to (name of t) as text
+        end try
+        if nm is not "#{expected_name}" then return "MISMATCH," & nm
+        set n0 to count of UI elements of lst
+        perform action "AXRemoveDesktop" of t
+        set n1 to n0
+        repeat #{(SPACE_REMOVE_TIMEOUT / SPACE_POLL_INTERVAL).round} times
+          delay #{SPACE_POLL_INTERVAL}
+          set n1 to count of UI elements of lst
+          if n1 is not n0 then exit repeat
+        end repeat
+        delay #{SPACE_REMOVE_SETTLE}
+        return (n0 as text) & "," & (n1 as text)
+      end tell
+    end tell
+  APPLESCRIPT
+
+  out, err, ok = osascript(script)
+  return [false, err] unless ok
+  return [false, "別のタイルを指しています(#{out.split(',', 2).last})"] if out.start_with?('MISMATCH')
+
+  n0, n1 = out.split(',').map(&:to_i)
+  return [false, "枚数が減りませんでした(#{n0} → #{n1})"] unless n1 == n0 - 1
+
+  [true, "#{n0} → #{n1}"]
+end
+
+# plist の type 配列を、Mission Control の画面数に合わせて並べ直す。取れなければ nil。
+# 戻り値は [画面ごとの type 配列, まとめ表示か]。
+#
+# 外部ディスプレイを外した直後は、Mission Control が全ての Space を1画面にまとめて表示する
+# 一方、plist は外したモニターの分をぶら下げたまま残る(実測: UI 1画面12枚 / plist [5, 7])。
+# このツールが動くのはまさにその瞬間なので、合計が一致するなら連結して1画面に対応させる。
+def align_layout(layout, names)
+  return [layout, false] if names.size == layout.size &&
+                            names.each_with_index.all? { |n, i| n.size == layout[i].size }
+  return [[layout.flatten], true] if names.size == 1 && names[0].size == layout.flatten.size
+
+  nil
+end
+
+# plist が UI に追いつくまで待って対応づける。戻り値は [画面ごとの type 配列, まとめ表示か,
+# 最後に読んだ plist]。時間切れなら1つ目が nil。
+def await_layout(names)
+  deadline = Time.now + SPACE_LAYOUT_TIMEOUT
+  loop do
+    layout = spaces_layout
+    aligned = layout && align_layout(layout, names)
+    return [aligned[0], aligned[1], layout] if aligned
+    return [nil, false, layout] if Time.now > deadline
+
+    sleep SPACE_LAYOUT_POLL
+  end
+end
+
+# 各ディスプレイの通常デスクトップを max 枚以下に減らす。
+def reduce_spaces(max)
+  layout = spaces_layout
+  return warn('操作スペースの構成を読めませんでした。削減をスキップします。') unless layout
+
+  opened, why = open_mission_control
+  unless opened
+    return warn("Mission Control を開けませんでした(#{why})。" \
+                'システム設定 > プライバシーとセキュリティ > アクセシビリティ を確認してください。')
+  end
+
+  begin
+    names = space_tile_names
+    return warn('Mission Control の UI を読めませんでした。削減をスキップします。') unless names
+
+    types_by_display, merged, layout = await_layout(names)
+    # 対応づけが取れないまま消すとフルスクリーンを巻き込むため、必ず中断する。
+    unless types_by_display
+      ui = names.map(&:size).inspect
+      settings = layout ? layout.map(&:size).inspect : '読めません'
+      return warn("#{SPACE_LAYOUT_TIMEOUT.round}秒待っても構成が一致しないため中断します" \
+                  "(UI #{ui} / 設定 #{settings})")
+    end
+
+    types_by_display.each_with_index do |types, i|
+      tiles = names[i].zip(types) # [[名前, type], ...]
+      desktops = tiles.count { |_, t| t == SPACE_TYPE_DESKTOP }
+      full = tiles.count - desktops
+
+      # まとめ表示では並び順を推定しているので、名前と突き合わせて裏を取る。
+      by_name = tiles.count { |n, _| n.match?(DESKTOP_TILE_NAME) }
+      if merged && by_name != desktops
+        warn "  ディスプレイ#{i + 1}: 名前と設定が食い違うため中断します" \
+             "(名前 #{by_name}枚 / 設定 #{desktops}枚)"
+        next
+      end
+
+      if desktops <= max
+        puts "  ディスプレイ#{i + 1}: デスクトップ #{desktops}枚 — 削減不要"
+        next
+      end
+
+      puts "  ディスプレイ#{i + 1}: デスクトップ #{desktops}枚 → #{max}枚 " \
+           "#{full.positive? ? "(フルスクリーン #{full}件は対象外)" : ''}"
+      while tiles.count { |_, t| t == SPACE_TYPE_DESKTOP } > max
+        pos = tiles.rindex { |_, t| t == SPACE_TYPE_DESKTOP } # 末尾のデスクトップから消す
+        name = tiles[pos].first
+        ok, detail = remove_space_tile(i + 1, pos + 1, name)
+        unless ok
+          warn "    中断: #{name} を削除できませんでした — #{detail}"
+          break
+        end
+        puts "    削除: #{name} (#{detail})"
+        tiles.delete_at(pos)
+      end
+    end
+  ensure
+    close_mission_control
+  end
 end
 
 # ---- 対話設定(--config) ---------------------------------------------------
@@ -476,6 +710,7 @@ OptionParser.new do |o|
   o.on('--stagger SEC', Float, '再起動の間隔秒(既定: 0.8)')        { |v| opts[:stagger] = v }
   o.on('--term-fallback', 'タイムアウト時に SIGTERM を送る(-9 はしない)') { opts[:term] = true }
   o.on('--require-single-display', 'ディスプレイが1枚でなければ中止') { opts[:single] = true }
+  o.on('--max-spaces N', Integer, '終了後に操作スペースをN枚以下に減らす') { |v| opts[:max_spaces] = v }
   o.on('--yes', '確認プロンプトを省略(非対話実行用)')              { opts[:yes] = true }
   o.separator ''
   o.separator '  常駐監視(launchd から起動する用):'
@@ -532,6 +767,16 @@ if opts[:watch]
                  end)
   end
 
+  # UI スクリプティングの許可(アクセシビリティ)は自動化とは別枠。--max-spaces を使う時だけ要る。
+  # 切断の瞬間に初めて発覚しても手の打ちようがないので、ここで一度読んで結果を残す。
+  if opts[:max_spaces]
+    _, ax_err = mission_control_state
+    logline.call(ax_err.nil? ? 'アクセシビリティ(UI スクリプティング)の許可: OK' :
+                               "アクセシビリティ(UI スクリプティング)の許可: NG — #{ax_err} / " \
+                               'システム設定 > プライバシーとセキュリティ > アクセシビリティ で ' \
+                               '/usr/bin/osascript を許可してください(操作スペースの削減のみ効きません)')
+  end
+
   prev_ext = ext
   last_run = nil
   loop do
@@ -581,7 +826,10 @@ if opts[:watch]
 
     logline.call('外部ディスプレイが全て切断されたため respawn を実行します')
     status = nil
-    Open3.popen2e(RbConfig.ruby, SELF, '--preset', opts[:preset], '--apply', '--yes') do |i, o, t|
+    # 実処理は子プロセスが行うので、監視側に渡された実行オプションは引き継ぐ。
+    child_args = ['--preset', opts[:preset], '--apply', '--yes']
+    child_args += ['--max-spaces', opts[:max_spaces].to_s] if opts[:max_spaces]
+    Open3.popen2e(RbConfig.ruby, SELF, *child_args) do |i, o, t|
       i.close
       o.each_line { |l| logline.call("  | #{utf8(l).chomp}") }
       status = t.value
@@ -714,6 +962,13 @@ end
 
 if targets.empty?
   puts "\n対象がありません。"
+  # 終了するアプリが無くても、操作スペースの削減は指示どおり行う
+  # (切断時に減らしたいのであって、終了処理に付随する処理ではないため)。
+  if opts[:apply] && opts[:max_spaces]
+    puts "\n操作スペースを #{opts[:max_spaces]}枚以下に減らします..."
+    reduce_spaces(opts[:max_spaces])
+    exit 0
+  end
   exit 1
 end
 
@@ -815,6 +1070,13 @@ unless remaining.empty?
     puts "  #{a[:name]} (#{a[:bid]}) — 保存ダイアログが出ている可能性があります。画面を確認してください。"
   end
   puts '  ※ 手動で終了してください。'
+end
+
+# アプリを終了させた後に減らす。先に終了させておけば対象の Space は空になっており、
+# 閉じても行き場を失うウィンドウが出ない。
+if opts[:max_spaces]
+  puts "\n操作スペースを #{opts[:max_spaces]}枚以下に減らします..."
+  reduce_spaces(opts[:max_spaces])
 end
 
 unless opts[:relaunch]

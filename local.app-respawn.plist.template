@@ -12,6 +12,8 @@
 		<string>--preset</string>
 		<string>default</string>
 		<string>--log-window</string>
+		<string>--max-spaces</string>
+		<string>3</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

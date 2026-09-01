@@ -17,6 +17,7 @@ SIP を有効なままにしたいので、この方針は採れない。
 - `--watch` で常駐し、**外部ディスプレイが全て外れた瞬間**に自動実行（launchd LaunchAgent）
 - `--log-window` で実行時に Terminal を開いて進捗を表示、完了後に自動で閉じる
 - `--config` でインストール済みアプリを絞り込みながら対話的にプリセットを編集
+- `--max-spaces N` で、アプリを終了させた後に操作スペース（Space / バーチャルデスクトップ）を N 枚以下に減らす
 
 ## セットアップ
 
@@ -40,8 +41,46 @@ cp app-respawn.example.json app-respawn.json   # 雛形をコピーして手で�
 app-respawn --init --apply                     # 起動中のアプリからまとめて生成
 ```
 
-初回は対象アプリへの Apple Event（自動化）の許可が必要になる。`--watch` は起動時に許可状態を確定させるので、
-ログに `対象アプリへの Apple Event 許可: OK` が出ていることを確認しておくとよい。
+### 必要な許可
+
+| 許可 | 何に要るか | 場所 |
+|---|---|---|
+| 自動化（Apple Event） | アプリの終了 | プライバシーとセキュリティ > 自動化 |
+| アクセシビリティ | `--max-spaces` の操作スペース削減のみ | プライバシーとセキュリティ > アクセシビリティ |
+
+アクセシビリティは**別枠**で、`ruby` と `osascript` の**両方**の登録が要る。詳細は
+[操作スペースの削減](#操作スペースの削減)を参照。無くても終了処理は動き、削減だけがスキップされる。
+
+### ダウンロードで持ち込んだ場合は隔離属性を外す
+
+Slack や zip で受け取ったファイル、および Sourcetree が clone したファイルには
+`com.apple.quarantine` が付く（コマンドラインの `git clone` では付かない）。`--log-window` は
+`app-respawn-log.command` を `open` で開くため、この属性が残っていると Gatekeeper に止められ、
+「開いていません／マルウェアが含まれていないことを検証できませんでした」のダイアログが出て
+**ログウィンドウが開かない**（本体の終了処理自体は動く）。
+
+```bash
+xattr -dr com.apple.quarantine .    # このディレクトリ配下から削除
+```
+
+`.git/objects` は read-only なので `Permission denied` で失敗するが、git object は実行されないため
+放置してよい。`~/Downloads` など出所の混ざる場所に同じ操作をしないこと。
+
+### 設置後の確認
+
+`--watch` は起動時に許可状態を確定させ、結果をログに残す。3行とも OK になっていれば設置は完了。
+
+```bash
+launchctl kickstart -k gui/$(id -u)/local.app-respawn
+tail -4 ~/Library/Logs/app-respawn.log
+```
+
+```
+watch 開始: ディスプレイ 2枚(外部 1枚) preset=default interval=3.0s settle=5.0s
+自動化(Apple Event)の許可: OK
+対象アプリへの Apple Event 許可: OK (起動中 9件を確認)
+アクセシビリティ(UI スクリプティング)の許可: OK
+```
 
 ## 使い方
 
@@ -50,6 +89,7 @@ app-respawn --list                 # 起動中の GUI アプリと bundle id を
 app-respawn                        # ドライラン(対象の確認だけ)
 app-respawn --apply                # 終了のみ実行(確認プロンプトあり)
 app-respawn --apply --relaunch     # 終了して現在の画面で開き直す
+app-respawn --apply --max-spaces 3 # 終了後、操作スペースを3枚以下に減らす
 app-respawn --config               # 対話的にプリセットを編集
 app-respawn --init --apply         # いま起動中のアプリから設定ファイルを生成
 ```
@@ -110,6 +150,42 @@ launchctl kickstart -k gui/$(id -u)/local.app-respawn
 launchctl print gui/$(id -u)/local.app-respawn | grep -E 'state|pid'
 tail -f ~/Library/Logs/app-respawn.log
 ```
+
+## 操作スペースの削減
+
+`--max-spaces N` を付けると、アプリの終了処理が終わった後に各ディスプレイの通常デスクトップを
+N 枚以下に減らす。先にアプリを終了させているので、閉じる操作スペースは空になっており、
+行き場を失うウィンドウが出ない。
+
+**フルスクリーンのアプリは対象外**。フルスクリーンの操作スペースを閉じるとフルスクリーンが
+解除されてしまうため、通常のデスクトップだけを末尾から減らす。
+
+**アクセシビリティの許可が別に要る。** Mission Control の UI を叩くので、自動化（Apple Event）とは
+別枠で「アクセシビリティ」の許可が必要になる。システム設定 > プライバシーとセキュリティ >
+アクセシビリティ に、**ruby と osascript の両方**を追加する。
+
+```
+/Users/<user>/.rbenv/versions/<version>/bin/ruby
+/usr/bin/osascript
+```
+
+`+` を押して `Cmd+Shift+G` でパスを貼り付ける（`.rbenv` は不可視ディレクトリなので、この方法でないと
+辿り着けない）。osascript だけでは通らない。TCC は**責任プロセス**で可否を判定し、launchd ジョブの
+子プロセスはジョブ先頭のプロセス（＝ruby）を責任プロセスとして引き継ぐため、ruby が一覧に無いと
+子の osascript ごと拒否される。エラーは `osascript` を名乗るが、見られているのは親の方。
+
+ruby のパスにはバージョンが入る。**rbenv で Ruby を上げるとこの許可は無効になる**（パスが変わり、
+ad-hoc 署名のハッシュも変わる）。macOS 標準の `/usr/bin/ruby` は 2.6 で、本体が使う 3.0 以降の構文を
+解釈できないため、安定したパスへは逃がせない。
+
+許可がないと `--watch` の起動時ログに次が出て、**削減だけがスキップされる**（アプリの終了は動く）。
+
+```
+アクセシビリティ(UI スクリプティング)の許可: NG — ... osascriptには補助アクセスは許可されません。 (-25211)
+```
+
+LaunchAgent は `--max-spaces 3` を渡しているので、外部モニターを外したときの自動実行にも適用される。
+枚数を変えたい場合は `local.app-respawn.plist.template` を編集して `./setup --apply` をやり直す。
 
 ## 構成
 
