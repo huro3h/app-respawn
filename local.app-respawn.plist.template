@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{{LABEL}}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{RUBY}}</string>
+		<string>{{SCRIPT}}</string>
+		<string>--watch</string>
+		<string>--preset</string>
+		<string>default</string>
+		<string>--log-window</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<!-- LANG が無いと default_external が US-ASCII になり、osascript の日本語エラーで落ちる -->
+		<key>LANG</key>
+		<string>ja_JP.UTF-8</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>{{LOG}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{LOG}}</string>
+</dict>
+</plist>

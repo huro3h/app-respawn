@@ -1,0 +1,841 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# app-respawn
+#   プリセットに書いた GUI アプリを graceful quit する。既定は終了のみで、開き直しは手作業。
+#   --relaunch を付けたときだけ、現在のディスプレイ/Space で起動し直す。
+#   外部モニターを外した後にウィンドウが1画面に重なる/別 Space に散る問題を、
+#   「探して動かす」代わりに「畳む」で解消する用途。
+#
+#   exit 0 = 全て終了できた / 1 = ドライラン or 残存・失敗あり / 2 = エラー
+
+require 'optparse'
+require 'json'
+require 'open3'
+require 'fiddle'
+require 'rbconfig'
+
+# launchd 配下では LANG が渡らず default_external が US-ASCII になる。その状態で日本語を含む
+# 外部コマンド出力(アプリ名や AppleScript のエラー文)を掴むと strip すら例外になるため固定する。
+# ターミナルからの実行では元々 UTF-8 なので実害はない。
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
+
+# --watch から popen で起動されると stdout がパイプになりブロックバッファされる。
+# それだと進捗が最後にまとめて出てログ追尾の意味がなくなるので、常に行単位で吐く。
+$stdout.sync = true
+
+# 外部コマンドの出力は必ずこれを通す。scrub は不正バイトが来ても落ちないようにするため。
+def utf8(str) = str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
+
+# 自分の実体からツールのルートを割り出す。設置場所を直書きしないのは、ディレクトリごと
+# 別マシンへ持って行っても、どこに置いても動くようにするため。
+# realpath を挟むのは、PATH に置く app-respawn がシンボリックリンクだから
+# (__FILE__ はリンク側のパスになり、そのままだと隣のファイルを見失う)。
+SELF = File.realpath(__FILE__)
+TOOL_ROOT = File.dirname(SELF)
+
+CONFIG_PATH = ENV.fetch('APP_RESPAWN_CONFIG', File.join(TOOL_ROOT, 'app-respawn.json'))
+# 設定は手元の環境に固有なので git 管理外。clone 直後はこれをコピーして使う。
+EXAMPLE_CONFIG = File.join(TOOL_ROOT, 'app-respawn.example.json')
+LOG_WINDOW = File.join(TOOL_ROOT, 'app-respawn-log.command')
+# その回の実行だけを書く一時ログ。ログウィンドウはこれを先頭から読む。
+RUN_LOG = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-current.log')
+# ログウィンドウを閉じたあと Terminal 自体も終わらせてよいかの印。
+# 元から Terminal を使っていた場合に巻き込まないよう、こちらが起動した回だけ置く。
+QUIT_MARKER = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-quit-terminal')
+
+# 落とすとメニューバーや Space の操作系が壊れる OS のコンポーネント。
+# プリセットに書かれていても絶対に quit しない。
+# Finder は当初ここに入れていたが、終了してもデータを失わず再起動も速いので対象に戻した。
+DENY_BUNDLE_IDS = %w[
+  com.apple.dock
+  com.apple.systemuiserver
+  com.apple.loginwindow
+  com.apple.controlcenter
+].freeze
+
+def die(msg, code = 2)
+  warn "error: #{msg}"
+  exit code
+end
+
+def osascript(script)
+  out, err, st = Open3.capture3('osascript', '-e', script)
+  [utf8(out).strip, utf8(err).strip, st.success?]
+end
+
+# 起動中の GUI アプリ(background only でないもの)を [bundle_id, name, pid] で返す。
+# 2回に分けて問い合わせると取得の合間にプロセスが増減してズレるため、1回の走査でまとめて取る。
+# 1件ごと try で囲むのは、列挙中にアプリが終了すると その要素だけ -1719 で落ちるため。
+# 消えた1件を捨てて残りを返す。加えて呼び出し側で3回までリトライする。
+# なお終了待ちの生存確認では本関数を使わない(下の alive? を使う)。
+LIST_SCRIPT = <<~APPLESCRIPT
+  tell application "System Events"
+    set outText to ""
+    repeat with p in (every application process whose background only is false)
+      try
+        set outText to outText & (bundle identifier of p) & tab & (name of p) & tab & (unix id of p) & linefeed
+      end try
+    end repeat
+  end tell
+  outText
+APPLESCRIPT
+
+def running_apps
+  last_err = nil
+  3.times do |i|
+    sleep 0.3 if i.positive?
+    out, err, ok = osascript(LIST_SCRIPT)
+    last_err = err
+    next unless ok
+
+    return out.lines.filter_map do |line|
+      bid, name, pid = line.chomp.split("\t", 3)
+      next if name.nil? || name.empty?
+
+      bid = '' if bid == 'missing value'
+      { bid: bid.to_s, name: name, pid: pid.to_i }
+    end
+  end
+  die("起動中アプリの取得に失敗しました: #{last_err}")
+end
+
+# 生存確認は pid で行う。終了処理中に System Events を何度も叩くと上記の -1719 を踏むうえ、
+# Apple Event の往復は遅い。シグナル0なら権限チェックだけで、プロセスには何も起きない。
+def alive?(pid)
+  Process.kill(0, pid)
+  true
+rescue Errno::ESRCH
+  false
+rescue Errno::EPERM
+  true
+end
+
+# ディスプレイ構成は CoreGraphics を直接呼んで読む。System Events(Apple Event)を使わないのは、
+# 常駐監視で数秒ごとに Apple Event を投げたくないのと、自動化(TCC)の許可なしで動かしたいため。
+CG_LIB = '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'
+MAX_DISPLAYS = 16
+
+def cg
+  @cg ||= begin
+    lib = Fiddle.dlopen(CG_LIB)
+    { list: Fiddle::Function.new(lib['CGGetActiveDisplayList'],
+                                 [Fiddle::TYPE_UINT32_T, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+                                 Fiddle::TYPE_INT),
+      online: Fiddle::Function.new(lib['CGGetOnlineDisplayList'],
+                                   [Fiddle::TYPE_UINT32_T, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+                                   Fiddle::TYPE_INT),
+      builtin: Fiddle::Function.new(lib['CGDisplayIsBuiltin'],
+                                    [Fiddle::TYPE_UINT32_T], Fiddle::TYPE_INT) }
+  end
+end
+
+# online = 接続されている(スリープ中・ミラー中も含む) / active = いま描画可能。
+# 判定に online を使うのが要点。active はディスプレイがスリープすると外れるため、
+# 「モニターが省電力で消えた」だけで「全部引き抜かれた」と誤判定して respawn が暴発する。
+def display_ids(kind = :online)
+  fn = kind == :online ? cg[:online] : cg[:list]
+  cnt = Fiddle::Pointer.malloc(4)
+  buf = Fiddle::Pointer.malloc(4 * MAX_DISPLAYS)
+  return [] unless fn.call(MAX_DISPLAYS, buf, cnt).zero?
+
+  n = cnt[0, 4].unpack1('L')
+  n.zero? ? [] : buf[0, 4 * n].unpack('L*')
+end
+
+# [ディスプレイ数, 外部ディスプレイ数] を返す。単なる枚数ではなく内蔵かどうかまで見るのは、
+# 「外部が全部外れて内蔵だけになった」を正確に捉えるため。
+def display_state(kind = :online)
+  ids = display_ids(kind)
+  [ids.size, ids.count { |id| cg[:builtin].call(id).zero? }]
+end
+
+def display_count = display_state.first
+
+def bundle_id_of_app(app_path)
+  plist = File.join(app_path, 'Contents', 'Info.plist')
+  return nil unless File.exist?(plist)
+
+  out, _, ok = Open3.capture3('/usr/libexec/PlistBuddy', '-c', 'Print CFBundleIdentifier', plist)
+  ok ? utf8(out).strip : nil
+end
+
+# 自分自身が動いているターミナル(iTerm2 等)を quit すると、待機中にスクリプトごと殺されて
+# 再起動フェーズに到達できない。親プロセスを遡ってアプリを特定し、対象から必ず外す。
+def self_terminal_bundle_ids
+  ids = []
+  pid = Process.pid
+  12.times do
+    out, _, ok = Open3.capture3('ps', '-p', pid.to_s, '-o', 'ppid=,comm=')
+    out = utf8(out)
+    break unless ok && !out.strip.empty?
+
+    ppid, comm = out.strip.split(/\s+/, 2)
+    if comm && (m = comm.match(%r{\A(.*?\.app)/Contents/MacOS/}))
+      bid = bundle_id_of_app(m[1])
+      ids << bid if bid && !bid.empty?
+    end
+    pid = ppid.to_i
+    break if pid <= 1
+  end
+  ids.uniq
+end
+
+def denied?(entry) = DENY_BUNDLE_IDS.include?(entry[:bid])
+
+def load_config
+  return nil unless File.exist?(CONFIG_PATH)
+
+  JSON.parse(File.read(CONFIG_PATH))
+rescue JSON::ParserError => e
+  die("設定ファイルが JSON として読めません (#{CONFIG_PATH}): #{e.message}")
+end
+
+# ---- 対話設定(--config) ---------------------------------------------------
+
+# インストール済みアプリの走査先。CoreServices を入れるのは Finder がそこにいるため
+# (/Applications には無い)。~/Applications は Chrome の PWA などが入る。
+APP_DIRS = [
+  '/Applications',
+  '/System/Applications',
+  '/System/Library/CoreServices',
+  File.join(Dir.home, 'Applications')
+].freeze
+
+# メニューバー常駐やデーモンは quit しても意味がないので一覧に出さない。
+# plist の真偽値は true / 1 / "1" のいずれでも書かれうる。
+def background_only?(info)
+  %w[1 true].include?(info['LSUIElement'].to_s) ||
+    %w[1 true].include?(info['LSBackgroundOnly'].to_s)
+end
+
+# Info.plist は1回の plutil でまとめて JSON にする。plutil -extract をキーごとに呼ぶと
+# アプリ数 × キー数だけプロセスが増えて、体感できるほど遅くなる。
+def app_info(path)
+  plist = File.join(path, 'Contents', 'Info.plist')
+  return nil unless File.exist?(plist)
+
+  out, _, st = Open3.capture3('plutil', '-convert', 'json', '-o', '-', plist)
+  return nil unless st.success?
+
+  d = JSON.parse(utf8(out))
+  bid = d['CFBundleIdentifier'].to_s
+  return nil if bid.empty? || background_only?(d)
+
+  name = d['CFBundleDisplayName'] || d['CFBundleName'] || File.basename(path, '.app')
+  { bid: bid, name: utf8(name.to_s), path: path }
+rescue JSON::ParserError
+  nil
+end
+
+# インストール済みの GUI アプリを返す。System Events を使わないのが要点で、
+# 設定を編集するだけのために自動化(Apple Event)の許可ダイアログを出したくない。
+# 実測: 250件前後を約1.3秒。mdfind に頼らないので Spotlight の索引状態にも左右されない。
+def installed_apps
+  seen = {}
+  APP_DIRS.each do |dir|
+    next unless File.directory?(dir)
+
+    # find -maxdepth 3 相当。深く辿らないのは Xcode.app のように内部へ大量の .app を
+    # 抱えるアプリがあり、それらを拾うと一覧が使い物にならなくなるため。
+    ['*.app', '*/*.app', '*/*/*.app'].each do |pat|
+      Dir.glob(File.join(dir, pat)).each do |path|
+        next unless File.directory?(path)
+        next if File.dirname(path).include?('.app/') # アプリに同梱された内部アプリ
+
+        info = app_info(path)
+        seen[info[:bid]] ||= info if info # 同じ bundle id は浅い階層で見つけた方を採る
+      end
+    end
+  end
+  seen.values.sort_by { |a| a[:name].downcase }
+end
+
+# 起動中かどうかも Apple Event なしで判定する。ps が出すコマンドのパスは
+# /Applications/Foo.app/Contents/MacOS/Foo なので、そこから .app を切り出せばよい。
+def running_app_paths
+  out, = Open3.capture2('ps', '-axo', 'comm=')
+  utf8(out).lines.filter_map { |l| l[%r{\A(.*?\.app)/Contents/MacOS/}, 1] }.uniq
+rescue StandardError
+  []
+end
+
+# 全角を2桁として数える。日本語名のアプリが混ざると桁が崩れるため。
+WIDE_CHAR = /[\p{Hiragana}\p{Katakana}\p{Han}\p{Hangul}　-〿！-｠]/
+def dwidth(str) = str.each_char.sum { |c| c.match?(WIDE_CHAR) ? 2 : 1 }
+
+def dpad(str, width)
+  s = str.to_s
+  s = s[0..-2] while dwidth(s) > width
+  s + (' ' * (width - dwidth(s)))
+end
+
+# 矢印キーは "\e[A" のような列で届く。Esc 単独(取消)と区別したいが、両者は先頭が同じなので
+# 「続きが即座に来ているか」で見分ける。人間が Esc を押しただけなら後続は来ない。
+# 待ち時間はキー入力の取りこぼし(低速な接続では後続が遅れて届く)と、Esc を押してから
+# 取消と判定されるまでの体感の兼ね合い。0.1 秒なら人間には即座に感じられる。
+ESC_SEQ_WAIT = 0.1
+
+def read_escape_seq
+  return nil unless IO.select([$stdin], nil, nil, ESC_SEQ_WAIT)
+
+  $stdin.getch # '[' or 'O'
+  return nil unless IO.select([$stdin], nil, nil, ESC_SEQ_WAIT)
+
+  $stdin.getch
+end
+
+# fzf 風の絞り込み UI。gem を増やさないため io/console(標準ライブラリ)の raw モードで組む。
+#
+# 印字文字は全て検索クエリに吸われるので、トグルを文字キーには割り当てられない。
+# 例えば f を force_quit に使うと "Finder" が検索できなくなる。そのため選択は space、
+# force_quit は Ctrl-F にした。space を使う都合上、検索クエリに空白は入れられない。
+#
+# キーは文字列ではなく序数で分岐する(制御文字をソースに直接書かずに済ませるため)。
+KEY_CTRL_C = 3
+KEY_CTRL_F = 6
+KEY_BS     = 8
+KEY_LF     = 10
+KEY_CR     = 13
+KEY_CTRL_N = 14
+KEY_CTRL_P = 16
+KEY_CTRL_U = 21
+KEY_ESC    = 27
+KEY_SPACE  = 32
+KEY_DEL    = 127
+
+# 端末の行数。IO.console は制御端末を掴めない状況(擬似端末経由の起動など)で nil を返すので、
+# $stdout 側から取り直し、それも駄目なら無難な既定値にする。
+def term_rows
+  IO.console&.winsize&.first || ($stdout.winsize.first if $stdout.respond_to?(:winsize)) || 24
+rescue StandardError
+  24
+end
+
+def run_config_tui(preset_name)
+  require 'io/console'
+  unless $stdin.tty? && $stdout.tty?
+    die('--config は対話端末でのみ使えます(パイプやリダイレクト経由では動きません)')
+  end
+
+  $stdout.print('インストール済みアプリを読み込み中...')
+  apps = installed_apps
+  running = running_app_paths
+  $stdout.print("\r\e[K")
+  die('インストール済みアプリを1件も検出できませんでした') if apps.empty?
+
+  cfg = load_config || {}
+  presets = cfg['presets'] || {}
+  # 並び順そのものが終了/起動の順序なので、既存の順番は壊さない。
+  order = Array(presets[preset_name]).dup
+  force = Array(cfg['force_quit']).dup
+
+  known = apps.to_h { |a| [a[:bid], a] }
+  # 設定にあるのにディスクで見つからないものは、黙って消さず先頭に出して気付けるようにする。
+  missing = order.reject { |b| known.key?(b) }
+                 .map { |b| { bid: b, name: '(アプリ未検出)', path: nil } }
+  entries = missing + apps
+  selected = order.to_h { |b| [b, true] }
+
+  query = ''
+  cursor = 0
+  top = 0
+  note = nil
+  action = :cancel
+
+  $stdin.raw do
+    loop do
+      q = query.downcase
+      list = q.empty? ? entries : entries.select { |e| "#{e[:name]} #{e[:bid]}".downcase.include?(q) }
+      cursor = cursor.clamp(0, [list.size - 1, 0].max)
+
+      rows = [term_rows - 7, 3].max
+      top = cursor if cursor < top
+      top = cursor - rows + 1 if cursor >= top + rows
+      top = 0 if list.size <= rows
+
+      out = +"\e[H\e[J"
+      out << "検索: #{query}\e[7m \e[0m   #{list.size}/#{entries.size}件   選択 #{order.size}件" \
+             "   [#{preset_name}]\r\n\r\n"
+      if list.empty?
+        out << "  該当なし\r\n"
+      else
+        list[top, rows].each_with_index do |e, i|
+          idx = top + i
+          here = idx == cursor
+          mark = selected[e[:bid]] ? '[x]' : '[ ]'
+          fq   = force.include?(e[:bid]) ? 'F' : ' '
+          run  = e[:path] && running.include?(e[:path]) ? '●' : ' '
+          out << (here ? "\e[7m" : '')
+          out << " #{here ? '>' : ' '} #{mark} #{fq} #{dpad(e[:name], 28)} #{dpad(e[:bid], 34)} #{run} "
+          out << (here ? "\e[0m" : '')
+          out << "\r\n"
+        end
+      end
+      out << "\r\n ● = 起動中   [x] = プリセットに含む   F = 未保存を破棄して強制終了\r\n"
+      out << " 上下 移動   space 選択   ^F 強制終了   Enter 保存   Esc 取消   ^U 検索クリア\r\n"
+      out << " #{note}\r\n" if note
+      $stdout.print(out)
+      note = nil
+
+      ch = $stdin.getch
+      next unless ch && ch.valid_encoding?
+
+      entry = list[cursor]
+
+      case ch.ord
+      when KEY_CR, KEY_LF
+        action = :save
+        break
+      when KEY_CTRL_C
+        break
+      when KEY_ESC
+        case read_escape_seq
+        when 'A' then cursor -= 1
+        when 'B' then cursor += 1
+        when nil then break # Esc 単独 = 取消
+        end
+      when KEY_CTRL_P then cursor -= 1
+      when KEY_CTRL_N then cursor += 1
+      when KEY_SPACE
+        next unless entry
+
+        if selected.delete(entry[:bid])
+          order.delete(entry[:bid])
+          force.delete(entry[:bid])
+        else
+          selected[entry[:bid]] = true
+          order << entry[:bid]
+        end
+      when KEY_CTRL_F
+        next unless entry
+
+        if force.delete(entry[:bid])
+          note = "force_quit を外しました: #{entry[:name]}"
+        else
+          force << entry[:bid]
+          # force_quit はプリセットに入っていて初めて効く修飾なので、同時に選択もする。
+          unless selected[entry[:bid]]
+            selected[entry[:bid]] = true
+            order << entry[:bid]
+          end
+          note = "force_quit に追加しました(未保存は破棄されます): #{entry[:name]}"
+        end
+      when KEY_DEL, KEY_BS then query = query[0..-2].to_s
+      when KEY_CTRL_U then query = ''
+      else
+        next unless ch.match?(/[[:print:]]/)
+
+        query += ch
+        cursor = 0
+      end
+    end
+  end
+
+  $stdout.print("\e[H\e[J")
+  if action != :save
+    puts '中止しました(設定ファイルは変更していません)。'
+    return
+  end
+
+  presets[preset_name] = order
+  cfg['presets'] = presets
+  cfg['force_quit'] = force
+  File.write(CONFIG_PATH, "#{JSON.pretty_generate(cfg)}\n")
+
+  puts "書き込みました: #{CONFIG_PATH}"
+  puts "  プリセット '#{preset_name}': #{order.size}件 / force_quit: #{force.size}件"
+  puts '  並び順を変えたいときは JSON を直接編集してください(先頭のアプリが最後に前面へ戻ります)。'
+  missing_after = order.reject { |b| known.key?(b) }
+  puts "  注意: 未検出のまま残した bundle id: #{missing_after.join(', ')}" unless missing_after.empty?
+end
+
+opts = { preset: 'default', timeout: 20, stagger: 0.8, interval: 3.0, settle: 5.0, cooldown: 120.0 }
+OptionParser.new do |o|
+  o.banner = <<~BANNER
+    Usage: app-respawn [options]
+
+    プリセットのアプリを graceful quit する(既定はドライラン、終了のみ)。
+    --relaunch を付けると、終了後に現在の画面で起動し直す。
+    設定ファイル: #{CONFIG_PATH}
+
+    Options:
+  BANNER
+  o.on('--apply', '実際に終了/再起動する(なければ計画表示のみ)') { opts[:apply] = true }
+  o.on('--preset NAME', "使用するプリセット名(既定: default)")     { |v| opts[:preset] = v }
+  o.on('--list', '起動中の GUI アプリを一覧表示して終了')          { opts[:list] = true }
+  o.on('--init', '起動中アプリから設定ファイルを生成')             { opts[:init] = true }
+  o.on('--config', 'インストール済みアプリから対話的に設定')       { opts[:config] = true }
+  o.on('--relaunch', '終了後に現在の画面で起動し直す')              { opts[:relaunch] = true }
+  o.on('--timeout SEC', Float, '終了待ちの上限秒(既定: 20)')       { |v| opts[:timeout] = v }
+  o.on('--stagger SEC', Float, '再起動の間隔秒(既定: 0.8)')        { |v| opts[:stagger] = v }
+  o.on('--term-fallback', 'タイムアウト時に SIGTERM を送る(-9 はしない)') { opts[:term] = true }
+  o.on('--require-single-display', 'ディスプレイが1枚でなければ中止') { opts[:single] = true }
+  o.on('--yes', '確認プロンプトを省略(非対話実行用)')              { opts[:yes] = true }
+  o.separator ''
+  o.separator '  常駐監視(launchd から起動する用):'
+  o.on('--watch', '外部ディスプレイが全て外れたら自動実行する')     { opts[:watch] = true }
+  o.on('--interval SEC', Float, '監視間隔の秒数(既定: 3)')          { |v| opts[:interval] = v }
+  o.on('--settle SEC', Float, '検出後に構成が落ち着くまでの待ち(既定: 5)') { |v| opts[:settle] = v }
+  o.on('--cooldown SEC', Float, '連続実行を抑止する秒数(既定: 120)') { |v| opts[:cooldown] = v }
+  o.on('--log-window', '実行時にログ追尾用のターミナルを開く')       { opts[:log_window] = true }
+  o.on('-h', '--help') { puts o; exit 0 }
+end.parse!(ARGV)
+
+if opts[:watch]
+  run_log = nil
+  logline = lambda do |m|
+    line = "#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} #{m}"
+    puts line          # launchd 経由で共有ログへ
+    run_log&.puts(line) # 実行中だけ、その回専用ログへも
+  end
+
+  cfg = load_config or die("設定ファイルがありません: #{CONFIG_PATH}")
+  ps = cfg['presets'] or die("設定に 'presets' がありません")
+  ps[opts[:preset]] or die("プリセット '#{opts[:preset]}' がありません(定義済み: #{ps.keys.join(', ')})")
+
+  total, ext = display_state
+  logline.call("watch 開始: ディスプレイ #{total}枚(外部 #{ext}枚) preset=#{opts[:preset]} " \
+               "interval=#{opts[:interval]}s settle=#{opts[:settle]}s")
+
+  # 起動時に無害な Apple Event を1回だけ投げて、自動化(TCC)の許可状態をここで確定させる。
+  # 実際に外部モニターが外れた瞬間に初めて許可ダイアログが出る、という事態を避けるため。
+  _, tcc_err, tcc_ok = osascript('tell application "System Events" to count desktops')
+  logline.call(tcc_ok ? '自動化(Apple Event)の許可: OK' :
+                        "自動化(Apple Event)の許可: NG — #{tcc_err} / システム設定 > プライバシーとセキュリティ > 自動化 で ruby を許可してください")
+
+  # Apple Event の許可は (呼び出し元, 対象アプリ) の組ごとに要る。ここで無害なイベントを
+  # 投げておかないと、実際にモニターが外れた瞬間に人数分の許可ダイアログが出て終了に失敗する。
+  # 起動中のアプリだけを対象にするのは、未起動のアプリに tell すると起動してしまうため。
+  if tcc_ok
+    running = running_apps.to_h { |a| [a[:bid], a[:name]] }
+    checked = 0
+    denied = []
+    ps[opts[:preset]].each do |bid|
+      name = running[bid] or next
+
+      checked += 1
+      _, err, ok = osascript(%(tell application id "#{bid}" to get name))
+      denied << name if !ok && err.include?('-1743')
+    end
+    logline.call(if denied.empty?
+                   "対象アプリへの Apple Event 許可: OK (起動中 #{checked}件を確認)"
+                 else
+                   "対象アプリへの Apple Event 許可が未取得: #{denied.join(', ')} " \
+                   '— システム設定 > プライバシーとセキュリティ > 自動化 で許可してください'
+                 end)
+  end
+
+  prev_ext = ext
+  last_run = nil
+  loop do
+    sleep opts[:interval]
+    total, ext = display_state
+    next if ext == prev_ext
+
+    act_total, act_ext = display_state(:active)
+    logline.call("ディスプレイ構成が変化: 外部 #{prev_ext} -> #{ext}枚 " \
+                 "(接続 #{total}枚/外部#{ext} 描画可能 #{act_total}枚/外部#{act_ext})")
+    was = prev_ext
+    prev_ext = ext
+    next unless was.positive? && ext.zero?
+
+    # 内蔵まで消えている = 全ディスプレイのスリープや切替中。抜かれたわけではないので触らない。
+    if total.zero?
+      logline.call('内蔵ディスプレイも見えないため実行しません(スリープ/切替中とみなす)')
+      next
+    end
+
+    if last_run && (Time.now - last_run) < opts[:cooldown]
+      logline.call("前回の実行から #{(Time.now - last_run).round}秒しか経っていないため見送ります" \
+                   "(cooldown #{opts[:cooldown].round}秒)")
+      next
+    end
+
+    # 抜き差しの途中や、ドック/切替器経由の一瞬の断で誤爆しないよう落ち着くまで待って見直す。
+    sleep opts[:settle]
+    _, ext_now = display_state
+    if ext_now.positive?
+      logline.call("待機中に外部ディスプレイが復帰(#{ext_now}枚)。実行しません")
+      prev_ext = ext_now
+      next
+    end
+
+    # その回専用ログを作り直してから窓を開く。窓は先頭から読むので、Terminal の起動が
+    # 何秒遅れても取りこぼさない(コールドスタートで実測8秒かかることがある)。
+    # open を使うのは、Terminal を AppleScript で操作すると自動化の許可が要るため。
+    if opts[:log_window]
+      run_log = File.open(RUN_LOG, 'w')
+      run_log.sync = true
+      File.delete(QUIT_MARKER) if File.exist?(QUIT_MARKER) # 前回の残りを持ち越さない
+      _, _, term_running = Open3.capture3('pgrep', '-x', 'Terminal')
+      File.write(QUIT_MARKER, "\n") unless term_running.success?
+      Open3.capture3('open', '-a', 'Terminal', LOG_WINDOW) if File.executable?(LOG_WINDOW)
+    end
+
+    logline.call('外部ディスプレイが全て切断されたため respawn を実行します')
+    status = nil
+    Open3.popen2e(RbConfig.ruby, SELF, '--preset', opts[:preset], '--apply', '--yes') do |i, o, t|
+      i.close
+      o.each_line { |l| logline.call("  | #{utf8(l).chomp}") }
+      status = t.value
+    end
+    logline.call("respawn 終了 (exit #{status.exitstatus})")
+    run_log&.close
+    run_log = nil
+    last_run = Time.now
+    prev_ext = display_state[1]
+  end
+end
+
+# running_apps(System Events)より前に処理する。設定を編集するだけで
+# 自動化の許可ダイアログを出さないため。
+if opts[:config]
+  run_config_tui(opts[:preset])
+  exit 0
+end
+
+apps = running_apps
+self_ids = self_terminal_bundle_ids
+
+if opts[:list]
+  puts "起動中の GUI アプリ: #{apps.size}件  (ディスプレイ #{display_count}枚)"
+  puts '=' * 72
+  apps.sort_by { |a| a[:name].downcase }.each do |a|
+    marks = []
+    marks << '除外:システム' if denied?(a)
+    marks << '除外:自ターミナル' if self_ids.include?(a[:bid])
+    printf("  %-34s %-38s %s\n", a[:bid].empty? ? '(bundle id なし)' : a[:bid], a[:name], marks.join(' '))
+  end
+  exit 0
+end
+
+if opts[:init]
+  targets = apps.reject { |a| denied?(a) || self_ids.include?(a[:bid]) || a[:bid].empty? }
+  config = { 'presets' => { 'default' => targets.map { |a| a[:bid] } } }
+  # force_quit は手で育てる設定なので、雛形の作り直しで消さない。
+  existing = load_config
+  config['force_quit'] = existing['force_quit'] if existing && existing['force_quit']
+  json = JSON.pretty_generate(config)
+  puts "生成する設定 (#{CONFIG_PATH}):"
+  puts json
+  unless opts[:apply]
+    puts "\n書き込むには --apply を付けて実行してください:"
+    puts '    app-respawn --init --apply'
+    exit 1
+  end
+  if File.exist?(CONFIG_PATH) && !opts[:yes]
+    print "\n既存の設定を上書きします。よろしいですか? [y/N] "
+    unless $stdin.gets&.strip&.downcase == 'y'
+      puts '中止しました。'
+      exit 1
+    end
+  end
+  File.write(CONFIG_PATH, "#{json}\n")
+  puts "\n書き込みました: #{CONFIG_PATH}"
+  exit 0
+end
+
+config = load_config
+unless config
+  warn "設定ファイルがありません: #{CONFIG_PATH}"
+  warn '次のコマンドで、いま起動中のアプリから雛形を作れます:'
+  warn '    app-respawn --init          # 内容を確認'
+  warn '    app-respawn --init --apply  # 書き込み'
+  warn "\n同梱の雛形をコピーして手で編集してもよい:"
+  warn "    cp #{EXAMPLE_CONFIG} #{CONFIG_PATH}"
+  exit 2
+end
+
+presets = config['presets'] or die("設定に 'presets' がありません")
+preset = presets[opts[:preset]] or
+  die("プリセット '#{opts[:preset]}' がありません(定義済み: #{presets.keys.join(', ')})")
+die("プリセット '#{opts[:preset]}' が配列ではありません") unless preset.is_a?(Array)
+
+# 未保存でも構わず閉じてよいアプリ(Office / Preview 等)。保存ダイアログで止まられるより
+# 破棄して開き直したいもの。quit saving no -> SIGTERM -> SIGKILL の順に段階を上げる。
+force_ids = Array(config['force_quit'])
+
+displays = display_count
+if opts[:single] && displays != 1
+  puts "ディスプレイが #{displays}枚のため中止しました(--require-single-display)。"
+  exit 0
+end
+
+by_bid = apps.to_h { |a| [a[:bid], a] }
+
+targets    = []
+skipped    = []
+not_running = []
+
+preset.each do |bid|
+  app = by_bid[bid]
+  if app.nil?
+    not_running << bid
+  elsif denied?(app)
+    skipped << [app, 'OS のコンポーネントのため除外']
+  elsif self_ids.include?(bid)
+    skipped << [app, 'このスクリプトを動かしているターミナルのため除外']
+  else
+    targets << app
+  end
+end
+
+puts "プリセット: #{opts[:preset]}  (#{CONFIG_PATH})"
+puts "ディスプレイ #{displays}枚 / 起動中 GUI アプリ #{apps.size}件"
+puts "\n#{'=' * 72}"
+puts "#{opts[:relaunch] ? '終了 → 再起動' : '終了'}する対象: #{targets.size}件"
+puts '=' * 72
+targets.each_with_index do |a, i|
+  mark = force_ids.include?(a[:bid]) ? '  ← 未保存は破棄して強制終了' : ''
+  printf("  %-4s %-30s %s (pid %d)%s\n", "[#{i + 1}]", a[:name], a[:bid], a[:pid], mark)
+end
+puts '  (なし)' if targets.empty?
+
+unless skipped.empty?
+  puts "\n#{'-' * 72}"
+  puts "除外: #{skipped.size}件"
+  puts '-' * 72
+  skipped.each { |a, why| printf("  %-30s %s\n", a[:name], why) }
+end
+
+unless not_running.empty?
+  puts "\n#{'-' * 72}"
+  puts "起動していないため対象外: #{not_running.size}件"
+  puts '-' * 72
+  not_running.each { |bid| puts "  #{bid}" }
+end
+
+if targets.empty?
+  puts "\n対象がありません。"
+  exit 1
+end
+
+unless opts[:apply]
+  puts "\n実際に実行するには --apply を付けてください:"
+  puts "    app-respawn --preset #{opts[:preset]} --apply#{opts[:relaunch] ? ' --relaunch' : ''}"
+  exit 1
+end
+
+unless opts[:yes]
+  forced = targets.select { |a| force_ids.include?(a[:bid]) }
+  unless forced.empty?
+    puts "\n※ 次のアプリは未保存の変更を破棄して終了します: #{forced.map { |a| a[:name] }.join(', ')}"
+  end
+  action = opts[:relaunch] ? '終了して開き直します' : '終了します(開き直しはしません)'
+  print "\n上記 #{targets.size}件を#{action}。よろしいですか? [y/N] "
+  unless $stdin.gets&.strip&.downcase == 'y'
+    puts '中止しました。終了は行っていません。'
+    exit 1
+  end
+end
+
+puts "\n終了を要求しています..."
+refused = []
+targets.each do |a|
+  if force_ids.include?(a[:bid])
+    # 標準 Suite の quit は saving パラメータを取る(CocoaStandard.sdef)。これで保存ダイアログを
+    # 出さずに破棄して終了できる。kill より優先するのは、Office 系を強制killすると次回起動時に
+    # 「ドキュメントの回復」が出て、開き直す目的が台無しになるため。
+    _, err, ok = osascript(%(tell application id "#{a[:bid]}" to quit saving no))
+    _, err, ok = osascript(%(tell application id "#{a[:bid]}" to quit)) unless ok
+  else
+    _, err, ok = osascript(%(tell application id "#{a[:bid]}" to quit))
+  end
+  # -609(接続は無効です) は、アプリが quit に応じて終了しきった後に返ることがある正常系。
+  # 実際に終了できたかは後段のポーリングで判定するので、ここでは黙る。
+  next if ok || err.include?('-609')
+
+  # -128 = 終了確認ダイアログでキャンセルされた。待っても状況は変わらないので印を付ける。
+  refused << a[:bid] if err.include?('-128')
+  puts "  quit を拒否されました: #{a[:name]} (#{err})"
+end
+
+# 保存ダイアログが出ているアプリは quit を投げても残る。ポーリングして残存を切り分ける。
+deadline = Time.now + opts[:timeout]
+remaining = targets.dup
+while Time.now < deadline && !remaining.empty?
+  sleep 0.4
+  gone, remaining = remaining.partition { |a| !alive?(a[:pid]) }
+  gone.each { |a| puts "  終了: #{a[:name]}" }
+
+  # 残りが「-128 を返した force_quit 対象」だけなら、確認ダイアログで止まったまま動かない。
+  # タイムアウトまで待つ意味がないので即座に強制終了フェーズへ送る。
+  next unless !remaining.empty? &&
+              remaining.all? { |a| refused.include?(a[:bid]) && force_ids.include?(a[:bid]) }
+
+  puts "  終了を拒否されたまま動かないため、タイムアウトを待たずに強制終了へ移ります"
+  break
+end
+
+# quit saving no でも閉じない = モーダルシート等で固まっている。明示的に許可されているので
+# TERM -> KILL まで上げる。ここまで来るのは異常系なので、何を殺したかは必ず出す。
+stuck_force = remaining.select { |a| force_ids.include?(a[:bid]) }
+unless stuck_force.empty?
+  puts "\n強制終了に切り替えます(force_quit 指定)..."
+  %w[TERM KILL].each do |sig|
+    stuck_force.each do |a|
+      Process.kill(sig, a[:pid])
+      puts "  SIG#{sig}: #{a[:name]} (pid #{a[:pid]})"
+    rescue StandardError => e
+      puts "  SIG#{sig} 失敗: #{a[:name]} (#{e.message})"
+    end
+    sleep(sig == 'TERM' ? 3 : 1)
+    remaining = remaining.select { |a| alive?(a[:pid]) }
+    stuck_force = remaining.select { |a| force_ids.include?(a[:bid]) }
+    break if stuck_force.empty?
+  end
+end
+
+if !remaining.empty? && opts[:term]
+  puts "\nタイムアウトしたため SIGTERM を送ります(-9 は使いません)..."
+  remaining.each do |a|
+    Process.kill('TERM', a[:pid])
+    puts "  TERM: #{a[:name]} (pid #{a[:pid]})"
+  rescue StandardError => e
+    puts "  TERM 失敗: #{a[:name]} (#{e.message})"
+  end
+  sleep 2
+  remaining = remaining.select { |a| alive?(a[:pid]) }
+end
+
+quit_ok = targets.reject { |a| remaining.any? { |r| r[:bid] == a[:bid] } }
+
+unless remaining.empty?
+  puts "\n#{'-' * 72}"
+  puts "終了しなかった(要対応): #{remaining.size}件"
+  puts '-' * 72
+  remaining.each do |a|
+    puts "  #{a[:name]} (#{a[:bid]}) — 保存ダイアログが出ている可能性があります。画面を確認してください。"
+  end
+  puts '  ※ 手動で終了してください。'
+end
+
+unless opts[:relaunch]
+  puts "\n終了 #{quit_ok.size}件。開き直しは行いません(--relaunch で自動起動)。"
+  exit remaining.empty? ? 0 : 1
+end
+
+puts "\n再起動しています(現在の画面/Space に開きます)..."
+relaunch_failed = []
+quit_ok.each do |a|
+  _, err, st = Open3.capture3('open', '-b', a[:bid])
+  err = utf8(err)
+  if st.success?
+    puts "  起動: #{a[:name]}"
+  else
+    relaunch_failed << a
+    puts "  起動失敗: #{a[:name]} (#{err.strip})"
+  end
+  sleep opts[:stagger]
+end
+
+# プリセットの並び順を優先度とみなし、最後に先頭のアプリを前面へ戻す。
+front = quit_ok.first
+if front && relaunch_failed.none? { |a| a[:bid] == front[:bid] }
+  osascript(%(tell application id "#{front[:bid]}" to activate))
+end
+
+puts "\n終了 #{quit_ok.size}件 / 再起動 #{quit_ok.size - relaunch_failed.size}件"
+exit (remaining.empty? && relaunch_failed.empty?) ? 0 : 1

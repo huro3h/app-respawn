@@ -1,0 +1,17 @@
+{
+  "presets": {
+    "default": [
+      "com.google.Chrome",
+      "com.tinyspeck.slackmacgap",
+      "com.apple.Preview",
+      "com.apple.finder",
+      "com.microsoft.Excel",
+      "com.microsoft.Word"
+    ]
+  },
+  "force_quit": [
+    "com.microsoft.Excel",
+    "com.microsoft.Word",
+    "com.apple.Preview"
+  ]
+}
