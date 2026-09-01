@@ -128,3 +128,7 @@ tail -f ~/Library/Logs/app-respawn.log
 ## 要件
 
 macOS / Ruby（追加の gem は不要）
+
+## ライセンス
+
+[MIT License](LICENSE)
