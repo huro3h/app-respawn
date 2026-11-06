@@ -10,6 +10,14 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-06
+
+### Changed
+- **Ruby を上げても許可が切れないようにした**: LaunchAgent が最初に起動するものを、ruby から小さな起動用バイナリ `app-respawn-launcher` に変えた。launcher が rbenv の shim 経由で ruby を起動するので、Ruby を上げても plist の作り直しも、自動化・アクセシビリティの許可の付け直しも要らない。許可は launcher に付く(移行時に一度だけ付け直しが要る)。`setup` は launcher を未ビルドかソースが新しいときだけビルドする(作り直すと許可が切れるため)。
+
+### Fixed
+- `setup --apply` を常駐中に実行すると、`launchctl bootstrap` が `5: Input/output error` で失敗し、常駐が外れたままになることがあった。古い登録が外れきるまで待ってから読み込むようにした。
+
 ## [1.1.0] - 2026-09-02
 
 ### Added

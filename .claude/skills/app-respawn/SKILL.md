@@ -187,12 +187,17 @@ LaunchAgent には `--max-spaces 3` を渡してある。
 > | launchd → `osascript` を直接 | OK |
 > | launchd → `ruby` → `osascript` | `-25211 osascriptには補助アクセスは許可されません` |
 >
-> TCC は**責任プロセス**で判定し、launchd ジョブの子はジョブ先頭のプロセス（ruby）を責任プロセスと
+> TCC は**責任プロセス**で判定し、launchd ジョブの子はジョブ先頭のプロセスを責任プロセスと
 > して引き継ぐ。よって osascript だけ許可しても通らない。エラーは osascript を名乗るので紛らわしい。
 > ターミナルから手で実行すると責任プロセスは iTerm2 になるため、**手動検証では再現しない**。
 >
-> ruby のパスはバージョンを含むので、rbenv で Ruby を上げると許可が切れる。`--watch` の起動時に
-> 1回読んでログへ残すようにしてあるので、上げた後は起動時ログを見ること。
+> **ジョブの先頭は `build/app-respawn-launcher`(Swift)にしてある**(2026-11-06〜)。以前は ruby を先頭にしていて、
+> Ruby を上げるたびに許可が切れていた。ローカルでビルドした ruby は ad-hoc 署名で、指定要件が
+> `cdhash H"..."`(バイナリのハッシュ)なので、パスを shim やシンボリックリンクにしても防げない。
+> launcher は rbenv の shim(`~/.rbenv/shims/ruby`)経由で ruby を子として起動し、SIGTERM/INT/HUP を子へ渡す。
+> 許可(自動化・アクセシビリティ)は launcher に付くので、Ruby を上げても plist も許可もそのままでよい。
+> **launcher を作り直すとハッシュが変わって許可が切れる**ので、`setup` は未ビルドかソースが新しいときだけビルドする。
+> 許可の状態は `--watch` の起動時に1回読んでログへ残すので、作り直した後は起動時ログを見ること。
 
 **Space を作成・削除する公開 API は存在しない**（2007年の導入以来ずっと）。非公開の
 `SkyLight` は WindowServer が Dock からの要求しか受け付けず、yabai が SIP の部分無効化を
@@ -367,8 +372,9 @@ plist は `--relaunch` を渡していないので、**自動実行も「終了�
 | ログ | `~/Library/Logs/app-respawn.log` |
 | 監視間隔 | 3秒（`--interval`）/ 検出後の待ち 5秒（`--settle`）/ 連続実行抑止 120秒（`--cooldown`） |
 
-plist は **`setup` がテンプレートから生成する**。ruby の実体パスとスクリプトの絶対パスを
-埋める必要があり、静的ファイルでは別マシンへ持ち運べないため。
+plist は **`setup` がテンプレートから生成する**。launcher・ruby(rbenv の shim)・スクリプトの絶対パスを
+埋める必要があり、静的ファイルでは別マシンへ持ち運べないため。shim は rbenv 本体を絶対パスで呼ぶので、
+launchd の痩せた PATH でも global のバージョンに解決できる(2026-11-06 に `launchctl submit` で確認)。
 
 ```bash
 # 停止して削除(PATH のリンクも消える)

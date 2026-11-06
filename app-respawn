@@ -27,7 +27,7 @@ $stdout.sync = true
 
 # リリース時はこことタグ(注釈付き・v なしの数字のみ)と CHANGELOG.md を揃える。
 # Chrome 拡張でいう manifest.json の version にあたる。
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 
 # 外部コマンドの出力は必ずこれを通す。scrub は不正バイトが来ても落ちないようにするため。
 def utf8(str) = str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
@@ -743,7 +743,7 @@ if opts[:watch]
   # 実際に外部モニターが外れた瞬間に初めて許可ダイアログが出る、という事態を避けるため。
   _, tcc_err, tcc_ok = osascript('tell application "System Events" to count desktops')
   logline.call(tcc_ok ? '自動化(Apple Event)の許可: OK' :
-                        "自動化(Apple Event)の許可: NG — #{tcc_err} / システム設定 > プライバシーとセキュリティ > 自動化 で ruby を許可してください")
+                        "自動化(Apple Event)の許可: NG — #{tcc_err} / システム設定 > プライバシーとセキュリティ > 自動化 で app-respawn-launcher を許可してください")
 
   # Apple Event の許可は (呼び出し元, 対象アプリ) の組ごとに要る。ここで無害なイベントを
   # 投げておかないと、実際にモニターが外れた瞬間に人数分の許可ダイアログが出て終了に失敗する。
@@ -774,7 +774,7 @@ if opts[:watch]
     logline.call(ax_err.nil? ? 'アクセシビリティ(UI スクリプティング)の許可: OK' :
                                "アクセシビリティ(UI スクリプティング)の許可: NG — #{ax_err} / " \
                                'システム設定 > プライバシーとセキュリティ > アクセシビリティ で ' \
-                               '/usr/bin/osascript を許可してください(操作スペースの削減のみ効きません)')
+                               'app-respawn-launcher と /usr/bin/osascript を許可してください(操作スペースの削減のみ効きません)')
   end
 
   prev_ext = ext

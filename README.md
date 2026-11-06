@@ -48,7 +48,8 @@ app-respawn --init --apply                     # 起動中のアプリからま�
 | 自動化（Apple Event） | アプリの終了 | プライバシーとセキュリティ > 自動化 |
 | アクセシビリティ | `--max-spaces` の操作スペース削減のみ | プライバシーとセキュリティ > アクセシビリティ |
 
-アクセシビリティは**別枠**で、`ruby` と `osascript` の**両方**の登録が要る。詳細は
+常駐(launchd)で動くときの許可は、入口の `app-respawn-launcher`(`setup` が `build/` にビルドする)に付く。
+アクセシビリティは**別枠**で、`app-respawn-launcher` と `osascript` の**両方**の登録が要る。詳細は
 [操作スペースの削減](#操作スペースの削減)を参照。無くても終了処理は動き、削減だけがスキップされる。
 
 ### ダウンロードで持ち込んだ場合は隔離属性を外す
@@ -162,21 +163,22 @@ N 枚以下に減らす。先にアプリを終了させているので、閉じ
 
 **アクセシビリティの許可が別に要る。** Mission Control の UI を叩くので、自動化（Apple Event）とは
 別枠で「アクセシビリティ」の許可が必要になる。システム設定 > プライバシーとセキュリティ >
-アクセシビリティ に、**ruby と osascript の両方**を追加する。
+アクセシビリティ に、**app-respawn-launcher と osascript の両方**を追加する。
 
 ```
-/Users/<user>/.rbenv/versions/<version>/bin/ruby
+/Users/<user>/projects/app-respawn/build/app-respawn-launcher
 /usr/bin/osascript
 ```
 
-`+` を押して `Cmd+Shift+G` でパスを貼り付ける（`.rbenv` は不可視ディレクトリなので、この方法でないと
-辿り着けない）。osascript だけでは通らない。TCC は**責任プロセス**で可否を判定し、launchd ジョブの
-子プロセスはジョブ先頭のプロセス（＝ruby）を責任プロセスとして引き継ぐため、ruby が一覧に無いと
-子の osascript ごと拒否される。エラーは `osascript` を名乗るが、見られているのは親の方。
+`+` を押して `Cmd+Shift+G` でパスを貼り付ける。osascript だけでは通らない。TCC は**責任プロセス**で
+可否を判定し、launchd ジョブの子プロセスはジョブ先頭のプロセス（＝app-respawn-launcher）を責任プロセスとして
+引き継ぐため、launcher が一覧に無いと子の ruby・osascript ごと拒否される。エラーは `osascript` を名乗るが、
+見られているのは先頭の方。
 
-ruby のパスにはバージョンが入る。**rbenv で Ruby を上げるとこの許可は無効になる**（パスが変わり、
-ad-hoc 署名のハッシュも変わる）。macOS 標準の `/usr/bin/ruby` は 2.6 で、本体が使う 3.0 以降の構文を
-解釈できないため、安定したパスへは逃がせない。
+launcher を挟んでいるのは、**Ruby を上げても許可が切れないようにするため**。ruby をジョブの先頭にすると、
+ad-hoc 署名の識別子がバイナリのハッシュなので、rbenv で Ruby を上げるたびに許可が無効になる。
+launcher は rbenv の shim 経由で ruby を起動するので、Ruby を上げても plist も許可もそのままでよい。
+逆に **launcher を作り直すとハッシュが変わり、許可が切れる**。`setup` はソースが変わったときだけビルドする。
 
 許可がないと `--watch` の起動時ログに次が出て、**削減だけがスキップされる**（アプリの終了は動く）。
 
@@ -194,8 +196,9 @@ LaunchAgent は `--max-spaces 3` を渡しているので、外部モニター�
 | `app-respawn` | 本体（Ruby、標準ライブラリのみ） |
 | `app-respawn.example.json` | プリセット定義の雛形（実体の `app-respawn.json` は `.gitignore`） |
 | `app-respawn-log.command` | `--log-window` で開くログ追尾ウィンドウ |
+| `app-respawn-launcher.swift` | LaunchAgent の入口。ruby を子として起動する（TCC の許可はこれに付く） |
 | `local.app-respawn.plist.template` | LaunchAgent のテンプレート |
-| `setup` | LaunchAgent の登録と PATH リンクの作成/削除 |
+| `setup` | launcher のビルド、LaunchAgent の登録と PATH リンクの作成/削除 |
 
 パスはスクリプトの実体位置から相対で解決しているので、ディレクトリごとどこへ移動しても動く。
 

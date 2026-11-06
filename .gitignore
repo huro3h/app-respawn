@@ -2,3 +2,6 @@
 app-respawn.json
 
 .DS_Store
+
+# setup がビルドする app-respawn-launcher
+build/

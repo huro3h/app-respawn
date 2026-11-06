@@ -2,8 +2,9 @@
 # frozen_string_literal: true
 
 # app-respawn のセットアップ。
-#   1. LaunchAgent の plist をテンプレートから生成して読み込ませる。
-#      plist には ruby とスクリプトの絶対パスが要るので、静的ファイルでは持ち運べない。
+#   1. 入口の app-respawn-launcher をビルドし(未ビルドかソースが新しいときだけ)、
+#      LaunchAgent の plist をテンプレートから生成して読み込ませる。
+#      plist には launcher・ruby・スクリプトの絶対パスが要るので、静的ファイルでは持ち運べない。
 #   2. PATH の通ったディレクトリに本体へのシンボリックリンクを張る。
 #
 #   exit 0 = OK / 2 = エラー
@@ -19,6 +20,13 @@ TEMPLATE  = File.join(TOOL_ROOT, "#{LABEL}.plist.template")
 SCRIPT    = File.join(TOOL_ROOT, 'app-respawn')
 DEST      = File.join(Dir.home, 'Library', 'LaunchAgents', "#{LABEL}.plist")
 LOG       = File.join(Dir.home, 'Library', 'Logs', 'app-respawn.log')
+# launchd が最初に起動する入口(app-respawn-launcher.swift)。TCC の許可はこれに付く
+LAUNCHER_SRC = File.join(TOOL_ROOT, 'app-respawn-launcher.swift')
+LAUNCHER     = File.join(TOOL_ROOT, 'build', 'app-respawn-launcher')
+# rbenv の shim は rbenv 本体を絶対パスで呼ぶので、launchd の痩せた PATH でも解決できる。
+# shim を渡しておけば、Ruby を上げても plist と許可をやり直さずに済む。rbenv が無ければ実体の ruby を渡す。
+RBENV_SHIM = File.join(ENV['RBENV_ROOT'] || File.join(Dir.home, '.rbenv'), 'shims', 'ruby')
+RUBY       = File.executable?(RBENV_SHIM) ? RBENV_SHIM : RbConfig.ruby
 
 # コマンド名で呼べるようにリンクを置く先の候補(優先順)。特定のパスを1つ直書きしないのは
 # Homebrew の prefix が Apple Silicon と Intel で違うため。PATH を総当たりしないのは、
@@ -72,10 +80,13 @@ end
 die("テンプレートがありません: #{TEMPLATE}") unless File.exist?(TEMPLATE)
 die("実行ファイルがありません: #{SCRIPT}") unless File.executable?(SCRIPT)
 
-# rbenv の shim は launchd から解決できないので、実体の ruby を埋める。
+# 作り直すとバイナリのハッシュが変わり、TCC の許可が切れる。ソースが変わったときだけビルドする
+build_launcher = !File.exist?(LAUNCHER) || File.mtime(LAUNCHER_SRC) > File.mtime(LAUNCHER)
+
 plist = File.read(TEMPLATE)
             .gsub('{{LABEL}}', LABEL)
-            .gsub('{{RUBY}}', RbConfig.ruby)
+            .gsub('{{LAUNCHER}}', LAUNCHER)
+            .gsub('{{RUBY}}', RUBY)
             .gsub('{{SCRIPT}}', SCRIPT)
             .gsub('{{LOG}}', LOG)
 
@@ -87,7 +98,8 @@ link_note =
 
 unless opts[:apply]
   puts "生成先: #{DEST}"
-  puts "  ruby   : #{RbConfig.ruby}"
+  puts "  launcher: #{LAUNCHER}#{build_launcher ? "(#{File.basename(LAUNCHER_SRC)} からビルドする)" : '(ビルド済み)'}"
+  puts "  ruby   : #{RUBY}"
   puts "  script : #{SCRIPT}"
   puts "  log    : #{LOG}"
   puts "  link   : #{link_note}"
@@ -95,12 +107,28 @@ unless opts[:apply]
   exit 0
 end
 
+if build_launcher
+  FileUtils.mkdir_p(File.dirname(LAUNCHER))
+  _, err, st = Open3.capture3('xcrun', 'swiftc', '-O', '-o', LAUNCHER, LAUNCHER_SRC)
+  die("#{File.basename(LAUNCHER)} のビルドに失敗: #{err}") unless st.success?
+  puts "#{File.basename(LAUNCHER)} をビルドしました。自動化・アクセシビリティの許可をこれに付け直してください"
+end
+
 FileUtils.mkdir_p(File.dirname(DEST))
 File.write(DEST, plist)
 _, err, st = Open3.capture3('plutil', '-lint', DEST)
 die("plist が不正です: #{err}") unless st.success?
 
-Open3.capture3('launchctl', 'bootout', "gui/#{uid}/#{LABEL}") # 既存があれば外す
+# 既存があれば外してから読み込む。bootout は外し終わる前に戻ることがあり、すぐ bootstrap すると
+# "Bootstrap failed: 5: Input/output error" になる(launcher の導入時に踏んだ。app-toggle と同じ)。消えるまで待つ。
+Open3.capture3('launchctl', 'bootout', "gui/#{uid}/#{LABEL}")
+deadline = Time.now + 5
+while Time.now < deadline
+  _, _, loaded = Open3.capture3('launchctl', 'print', "gui/#{uid}/#{LABEL}")
+  break unless loaded.success?
+
+  sleep 0.1
+end
 _, err, st = Open3.capture3('launchctl', 'bootstrap', "gui/#{uid}", DEST)
 die("launchctl bootstrap に失敗: #{err}") unless st.success?
 
