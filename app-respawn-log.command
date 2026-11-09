@@ -39,8 +39,8 @@ cleanup
 trap - EXIT
 
 printf '%.0s─' {1..64}; echo
-echo "完了しました。5秒後にこのウィンドウを閉じます (Ctrl-C で残す)"
-sleep 5
+echo "完了しました。1秒後にこのウィンドウを閉じます (Ctrl-C で残す)"
+sleep 1
 
 # app-respawn が Terminal を起動した回だけマーカーが置かれる。元から使っていた Terminal を
 # 巻き込まないための印。念のため「他にウィンドウが残っていない」ことも確かめてから quit する。
