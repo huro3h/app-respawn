@@ -27,7 +27,7 @@ $stdout.sync = true
 
 # リリース時はこことタグ(注釈付き・v なしの数字のみ)と CHANGELOG.md を揃える。
 # Chrome 拡張でいう manifest.json の version にあたる。
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 
 # 外部コマンドの出力は必ずこれを通す。scrub は不正バイトが来ても落ちないようにするため。
 def utf8(str) = str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
@@ -47,7 +47,9 @@ LOG_WINDOW = File.join(TOOL_ROOT, 'app-respawn-log.command')
 RUN_LOG = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-current.log')
 # ログウィンドウを閉じたあと Terminal 自体も終わらせてよいかの印。
 # 元から Terminal を使っていた場合に巻き込まないよう、こちらが起動した回だけ置く。
+# 中身が "preset" のときは、プリセットに Terminal が入っているので他の窓があっても終わらせる。
 QUIT_MARKER = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-quit-terminal')
+TERMINAL_BID = 'com.apple.Terminal'
 
 # 落とすとメニューバーや Space の操作系が壊れる OS のコンポーネント。
 # プリセットに書かれていても絶対に quit しない。
@@ -689,7 +691,7 @@ def run_config_tui(preset_name)
   puts "  注意: 未検出のまま残した bundle id: #{missing_after.join(', ')}" unless missing_after.empty?
 end
 
-opts = { preset: 'default', timeout: 20, stagger: 0.8, interval: 3.0, settle: 5.0, cooldown: 120.0 }
+opts = { preset: 'default', timeout: 20, stagger: 0.8, interval: 3.0, settle: 5.0, cooldown: 120.0, keep: [] }
 OptionParser.new do |o|
   o.banner = <<~BANNER
     Usage: app-respawn [options]
@@ -712,6 +714,7 @@ OptionParser.new do |o|
   o.on('--require-single-display', 'ディスプレイが1枚でなければ中止') { opts[:single] = true }
   o.on('--max-spaces N', Integer, '終了後に操作スペースをN枚以下に減らす') { |v| opts[:max_spaces] = v }
   o.on('--yes', '確認プロンプトを省略(非対話実行用)')              { opts[:yes] = true }
+  o.on('--keep BUNDLE_ID', 'プリセットに入っていても終了しない(複数可)') { |v| opts[:keep] << v }
   o.separator ''
   o.separator '  常駐監視(launchd から起動する用):'
   o.on('--watch', '外部ディスプレイが全て外れたら自動実行する')     { opts[:watch] = true }
@@ -820,7 +823,11 @@ if opts[:watch]
       run_log.sync = true
       File.delete(QUIT_MARKER) if File.exist?(QUIT_MARKER) # 前回の残りを持ち越さない
       _, _, term_running = Open3.capture3('pgrep', '-x', 'Terminal')
-      File.write(QUIT_MARKER, "\n") unless term_running.success?
+      if ps[opts[:preset]].include?(TERMINAL_BID)
+        File.write(QUIT_MARKER, "preset\n")
+      elsif !term_running.success?
+        File.write(QUIT_MARKER, "\n")
+      end
       Open3.capture3('open', '-a', 'Terminal', LOG_WINDOW) if File.executable?(LOG_WINDOW)
     end
 
@@ -829,6 +836,10 @@ if opts[:watch]
     # 実処理は子プロセスが行うので、監視側に渡された実行オプションは引き継ぐ。
     child_args = ['--preset', opts[:preset], '--apply', '--yes']
     child_args += ['--max-spaces', opts[:max_spaces].to_s] if opts[:max_spaces]
+    # ログ窓は Terminal で bash を動かしているので、Terminal に quit を送ると「このウインドウで
+    # 実行中のプロセスを終了しますか?」で止まり、終了待ちのまま進まなくなる。ここでは外し、
+    # プリセットに入っていればログ窓が閉じたあとに自分で終わらせる(QUIT_MARKER)。
+    child_args += ['--keep', TERMINAL_BID] if opts[:log_window]
     Open3.popen2e(RbConfig.ruby, SELF, *child_args) do |i, o, t|
       i.close
       o.each_line { |l| logline.call("  | #{utf8(l).chomp}") }
@@ -930,6 +941,8 @@ preset.each do |bid|
     skipped << [app, 'OS のコンポーネントのため除外']
   elsif self_ids.include?(bid)
     skipped << [app, 'このスクリプトを動かしているターミナルのため除外']
+  elsif opts[:keep].include?(bid)
+    skipped << [app, '--keep 指定のため除外']
   else
     targets << app
   end

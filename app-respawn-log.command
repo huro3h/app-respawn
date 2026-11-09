@@ -44,9 +44,11 @@ sleep 5
 
 # app-respawn が Terminal を起動した回だけマーカーが置かれる。元から使っていた Terminal を
 # 巻き込まないための印。念のため「他にウィンドウが残っていない」ことも確かめてから quit する。
+# 中身が preset なら、プリセットに Terminal が入っているので他の窓が残っていても終わらせる。
 QUIT_APP=""
 if [ -f "$QUIT_MARKER" ]; then
   QUIT_APP=yes
+  [ "$(cat "$QUIT_MARKER")" = "preset" ] && QUIT_APP=preset
   rm -f "$QUIT_MARKER"
 fi
 
@@ -65,7 +67,12 @@ tell application "Terminal"
   end repeat
   if victim is not missing value then close victim
 EOF
-  if [ -n "$QUIT_APP" ]; then
+  if [ "$QUIT_APP" = "preset" ]; then
+    cat <<'EOF'
+  delay 0.5
+  quit
+EOF
+  elif [ -n "$QUIT_APP" ]; then
     cat <<'EOF'
   delay 0.5
   if (count of (every window whose visible is true)) is 0 then quit
