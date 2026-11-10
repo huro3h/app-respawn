@@ -14,6 +14,7 @@ require 'json'
 require 'open3'
 require 'fiddle'
 require 'rbconfig'
+require 'shellwords'
 
 # launchd 配下では LANG が渡らず default_external が US-ASCII になる。その状態で日本語を含む
 # 外部コマンド出力(アプリ名や AppleScript のエラー文)を掴むと strip すら例外になるため固定する。
@@ -27,7 +28,7 @@ $stdout.sync = true
 
 # リリース時はこことタグ(注釈付き・v なしの数字のみ)と CHANGELOG.md を揃える。
 # Chrome 拡張でいう manifest.json の version にあたる。
-VERSION = '1.1.3'
+VERSION = '1.2.0'
 
 # 外部コマンドの出力は必ずこれを通す。scrub は不正バイトが来ても落ちないようにするため。
 def utf8(str) = str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
@@ -50,6 +51,13 @@ RUN_LOG = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-current.log')
 # 中身が "preset" のときは、プリセットに Terminal が入っているので他の窓があっても終わらせる。
 QUIT_MARKER = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-quit-terminal')
 TERMINAL_BID = 'com.apple.Terminal'
+# ログ窓のファイルに隔離属性が付いていたときに、外し方だけを表示する使い捨ての窓。
+# launchd 配下の ruby がその場で書いたファイルには隔離属性が付かないので、Gatekeeper に止められない。
+QUARANTINE_NOTICE = File.join(Dir.home, 'Library', 'Logs', 'app-respawn-quarantine.command')
+# 説明の窓のタイトル。属性を外した後の通常の回で、ログ窓が閉じるときにこれで見つけて一緒に閉じる
+# (app-respawn-log.command と揃える)。tty で探さないのは、終了済みの窓が使い回された tty 名を
+# 返し続けるため(実測で、案内の窓もログ窓も同じ /dev/ttys007 を返した)。
+QUARANTINE_TITLE = 'app-respawn 隔離属性'
 
 # 落とすとメニューバーや Space の操作系が壊れる OS のコンポーネント。
 # プリセットに書かれていても絶対に quit しない。
@@ -69,6 +77,42 @@ end
 def osascript(script)
   out, err, st = Open3.capture3('osascript', '-e', script)
   [utf8(out).strip, utf8(err).strip, st.success?]
+end
+
+# 隔離属性(com.apple.quarantine)の付いたファイルを返す。Sourcetree で pull/clone すると、
+# 更新されたファイルに付く。付いた .command を open すると Gatekeeper のダイアログで止まる。
+def quarantined_files
+  [LOG_WINDOW, SELF].select do |path|
+    File.exist?(path) && Open3.capture3('xattr', '-p', 'com.apple.quarantine', path)[2].success?
+  end
+end
+
+# 外すコマンドは見つけたファイルだけに絞る。ディレクトリごと -r で外すと、read-only の
+# .git/objects で Permission denied が大量に出て、肝心のファイルが外れたのか分からなくなる。
+def quarantine_message(files)
+  names = files.map { |f| File.basename(f) }.join(', ')
+  <<~MSG
+    #{names} に隔離属性(com.apple.quarantine)が付いているため、
+    ログウィンドウを開けませんでした。Sourcetree で pull/clone すると付きます。
+    次のコマンドで外してください(何も表示されなければ成功です):
+      xattr -d com.apple.quarantine #{files.map { |f| Shellwords.escape(f) }.join(' ')}
+    アプリの終了処理は行っていません。外したあと、外部モニターを抜き差しし直してください。
+  MSG
+end
+
+# .command は Gatekeeper に止められて1行も動かないので、説明は ruby 側で書いた別の窓に出す。
+# 読んでもらうための窓なので、その回では閉じず、Terminal も終わらせない。属性を外した後の
+# 通常の回で、ログ窓が閉じるときに一緒に閉じる(QUARANTINE_TITLE)。
+def open_quarantine_notice(msg)
+  File.write(QUARANTINE_NOTICE, <<~SH)
+    #!/bin/bash
+    printf '\\033]0;#{QUARANTINE_TITLE}\\007'
+    cat <<'EOF'
+    #{msg.chomp}
+    EOF
+  SH
+  File.chmod(0o755, QUARANTINE_NOTICE)
+  Open3.capture3('open', '-a', 'Terminal', QUARANTINE_NOTICE)
 end
 
 # 起動中の GUI アプリ(background only でないもの)を [bundle_id, name, pid] で返す。
@@ -691,7 +735,7 @@ def run_config_tui(preset_name)
   puts "  注意: 未検出のまま残した bundle id: #{missing_after.join(', ')}" unless missing_after.empty?
 end
 
-opts = { preset: 'default', timeout: 20, stagger: 0.8, interval: 3.0, settle: 5.0, cooldown: 120.0, keep: [] }
+opts = { preset: 'default', timeout: 20, stagger: 0.8, interval: 3.0, settle: 5.0, cooldown: 60.0, keep: [] }
 OptionParser.new do |o|
   o.banner = <<~BANNER
     Usage: app-respawn [options]
@@ -720,7 +764,7 @@ OptionParser.new do |o|
   o.on('--watch', '外部ディスプレイが全て外れたら自動実行する')     { opts[:watch] = true }
   o.on('--interval SEC', Float, '監視間隔の秒数(既定: 3)')          { |v| opts[:interval] = v }
   o.on('--settle SEC', Float, '検出後に構成が落ち着くまでの待ち(既定: 5)') { |v| opts[:settle] = v }
-  o.on('--cooldown SEC', Float, '連続実行を抑止する秒数(既定: 120)') { |v| opts[:cooldown] = v }
+  o.on('--cooldown SEC', Float, '連続実行を抑止する秒数(既定: 60)') { |v| opts[:cooldown] = v }
   o.on('--log-window', '実行時にログ追尾用のターミナルを開く')       { opts[:log_window] = true }
   o.on('--version', 'バージョンを表示') { puts "app-respawn #{VERSION}"; exit 0 }
   o.on('-h', '--help') { puts o; exit 0 }
@@ -818,7 +862,19 @@ if opts[:watch]
     # その回専用ログを作り直してから窓を開く。窓は先頭から読むので、Terminal の起動が
     # 何秒遅れても取りこぼさない(コールドスタートで実測8秒かかることがある)。
     # open を使うのは、Terminal を AppleScript で操作すると自動化の許可が要るため。
-    if opts[:log_window]
+    quarantined = opts[:log_window] ? quarantined_files : []
+    if quarantined.any?
+      # 隔離属性の付いたログ窓は open しない。代わりに外し方を窓と常駐ログに出し、本体は実行しない。
+      # 実行すると説明の窓が開く裏で Mission Control が開閉し、ログも見られない中途半端な回になるため。
+      # 属性を外して抜き差しし直せば動くよう、cooldown の起点(last_run)は更新しない。
+      # Terminal は説明の窓を残すために終わらせない(マーカーを置かない)。
+      File.delete(QUIT_MARKER) if File.exist?(QUIT_MARKER)
+      msg = quarantine_message(quarantined)
+      msg.each_line { |l| logline.call(l.chomp) }
+      open_quarantine_notice(msg)
+      logline.call('隔離属性を外すまで respawn は実行しません')
+      next
+    elsif opts[:log_window]
       run_log = File.open(RUN_LOG, 'w')
       run_log.sync = true
       File.delete(QUIT_MARKER) if File.exist?(QUIT_MARKER) # 前回の残りを持ち越さない

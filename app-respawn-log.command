@@ -8,6 +8,10 @@
 
 LOG="$HOME/Library/Logs/app-respawn-current.log"
 QUIT_MARKER="$HOME/Library/Logs/app-respawn-quit-terminal"
+# 窓のタイトル。閉じる窓を見分けるのに使う。終了済みの窓は使い回された tty 名を返し続けるので、
+# tty だけでは自分の窓と、隔離属性で止まった回に app-respawn が出した説明の窓を区別できない。
+TITLE="app-respawn 実行ログ"
+NOTICE_TITLE="app-respawn 隔離属性"   # app-respawn の QUARANTINE_TITLE と揃える
 MYTTY=$(tty)
 FIFO=$(mktemp -u -t app-respawn-fifo) || exit 1
 TAIL_PID=""
@@ -24,7 +28,7 @@ mkfifo "$FIFO" || exit 1
 tail -n +1 -F "$LOG" > "$FIFO" 2>/dev/null &
 TAIL_PID=$!
 
-printf '\033]0;app-respawn\007'
+printf '\033]0;%s\007' "$TITLE"
 echo "app-respawn — 実行ログ"
 printf '%.0s─' {1..64}; echo
 
@@ -59,13 +63,20 @@ CLOSER=$(mktemp -t app-respawn-close)
 {
   cat <<EOF
 tell application "Terminal"
-  set victim to missing value
+  -- 自分の窓に加えて、属性を外す前の回に出た説明の窓も閉じる
+  set victims to {}
   repeat with w in windows
-    repeat with t in tabs of w
-      if tty of t is "$MYTTY" then set victim to w
-    end repeat
+    if name of w contains "$NOTICE_TITLE" then set end of victims to id of w
+    if name of w contains "$TITLE" then
+      repeat with t in tabs of w
+        if tty of t is "$MYTTY" then set end of victims to id of w
+      end repeat
+    end if
   end repeat
-  if victim is not missing value then close victim
+  -- 閉じると windows の並びが変わるので、参照ではなく id で閉じる
+  repeat with vid in victims
+    close (first window whose id is vid)
+  end repeat
 EOF
   if [ "$QUIT_APP" = "preset" ]; then
     cat <<'EOF'

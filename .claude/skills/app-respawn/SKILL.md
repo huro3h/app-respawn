@@ -325,11 +325,33 @@ plist に `--log-window` を渡してあるので自動実行時は既定で有�
 > 起動するので Gatekeeper の検査対象になり、「開いていません／検証できませんでした」の
 > ダイアログで止まる。本体は `ruby app-respawn` として直接動くため同じ属性があっても素通りし、
 > **ログウィンドウだけが出ない**という分かりにくい壊れ方をする。
-> `xattr -dr com.apple.quarantine <ディレクトリ>` で外す。Slack や zip で受け取った場合のほか、
-> **Sourcetree が clone したファイルにも付く**（コマンドラインの `git clone` では付かない）。
+> `xattr -d com.apple.quarantine app-respawn app-respawn-log.command` のようにファイルを名指しして外す。
+> ディレクトリごと `-dr` で外すと read-only の `.git/objects` で `Permission denied` が大量に出て、
+> 肝心のファイルが外れたのか分からなくなる（当初は案内にこれを出していて混乱させた）。
 >
-> なお `File.executable?(LOG_WINDOW)` のガードがあるので、ファイル自体が無い場合も
-> **黙ってスキップ**される。ログにも何も出ないので、開かない時はまずファイルの有無と属性を見る。
+> 属性は Slack や zip で受け取った場合のほか、**Sourcetree が clone したファイル、および pull して
+> 更新されたファイルにも付く**（コマンドラインの `git clone` / `git pull` では付かない）。
+>
+> 発火時に `LOG_WINDOW` と `SELF` を `xattr -p com.apple.quarantine` で確かめ、付いていれば
+> ログ窓は `open` せず、外し方だけを表示する使い捨ての `.command`（`QUARANTINE_NOTICE`、
+> `~/Library/Logs/app-respawn-quarantine.command`）をその場で書いて開く（#2）。`.command` 側は
+> Gatekeeper に止められて1行も動かないので、説明は ruby 側で出すしかない。launchd 配下の ruby が
+> 書いたファイルには隔離属性が付かないので、この窓は止められない。同じ内容を常駐ログにも出す。
+> 説明の窓はその回では閉じず、Terminal も終わらせない（マーカーを置かない）。属性を外した後の
+> 通常の回で、ログ窓が閉じるときに**タイトル（`QUARANTINE_TITLE` = "app-respawn 隔離属性"）で見つけて**一緒に閉じる。
+>
+> **窓を tty で見分けてはいけない。** シェルが終わった窓は、その後に別の窓へ使い回された tty 名を
+> 返し続ける。実測で、案内の窓・ログ窓・無関係の窓がすべて `/dev/ttys007` を返した。
+> そのためログ窓も自分のタイトル（"app-respawn 実行ログ"）と tty の両方で自分を特定している。
+> また `contents of tab` は AppleScript 組み込みの `contents of`（参照の中身）と衝突して
+> `-1700` になり、閉じるスクリプト全体が失敗する。タブの文字を読みたいときは `history` を使う。
+>
+> **この回はアプリの終了処理を行わない。** 当初は続けていたが、`open` は Terminal の起動を待たずに
+> 戻るので、説明の窓が立ち上がる裏で Mission Control が開閉し、ログも見られない中途半端な回になった
+> （2026-11-10 に実機で確認）。属性を外して抜き差しし直せば動くよう、`last_run` は更新しない。
+>
+> なお `File.executable?(LOG_WINDOW)` のガードがあるので、ファイル自体が無い場合は
+> **黙ってスキップ**される。ログにも何も出ないので、開かない時はまずファイルの有無を見る。
 
 ウィンドウを閉じた後、**Terminal.app 本体も終了させる**。ただし元から Terminal を使っていた場合に
 巻き込まないよう、`pgrep -x Terminal` で**未起動だった回だけ**マーカーを置き、その回に限って quit する。
@@ -379,7 +401,7 @@ plist は `--relaunch` を渡していないので、**自動実行も「終了�
 | plist テンプレート | `local.app-respawn.plist.template` |
 | 生成先 | `~/Library/LaunchAgents/local.app-respawn.plist` |
 | ログ | `~/Library/Logs/app-respawn.log` |
-| 監視間隔 | 3秒（`--interval`）/ 検出後の待ち 5秒（`--settle`）/ 連続実行抑止 120秒（`--cooldown`） |
+| 監視間隔 | 3秒（`--interval`）/ 検出後の待ち 5秒（`--settle`）/ 連続実行抑止 60秒（`--cooldown`） |
 
 plist は **`setup` がテンプレートから生成する**。launcher・ruby(rbenv の shim)・スクリプトの絶対パスを
 埋める必要があり、静的ファイルでは別マシンへ持ち運べないため。shim は rbenv 本体を絶対パスで呼ぶので、

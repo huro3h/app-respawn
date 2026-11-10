@@ -54,18 +54,28 @@ app-respawn --init --apply                     # 起動中のアプリからま�
 
 ### ダウンロードで持ち込んだ場合は隔離属性を外す
 
-Slack や zip で受け取ったファイル、および Sourcetree が clone したファイルには
-`com.apple.quarantine` が付く（コマンドラインの `git clone` では付かない）。`--log-window` は
+Slack や zip で受け取ったファイル、および Sourcetree が clone したファイル・**pull して更新されたファイル**には
+`com.apple.quarantine` が付く（コマンドラインの `git clone` / `git pull` では付かない）。`--log-window` は
 `app-respawn-log.command` を `open` で開くため、この属性が残っていると Gatekeeper に止められ、
 「開いていません／マルウェアが含まれていないことを検証できませんでした」のダイアログが出て
-**ログウィンドウが開かない**（本体の終了処理自体は動く）。
+**ログウィンドウが開かない**。
+
+そのため `--watch` は発火時に `app-respawn-log.command` と `app-respawn` の隔離属性を確かめ、
+付いていればログ窓を開かずに、外し方を書いた別の窓（`~/Library/Logs/app-respawn-quarantine.command`）を
+開く。同じ内容は常駐ログにも出る。この窓はその回では閉じず、属性を外した後の通常の回で、ログ窓が閉じるときに一緒に閉じる。
+ログを見られないまま中途半端に動かないよう、**この回はアプリの終了処理を行わない**。属性を外したあと、
+外部モニターを抜き差しし直せば実行される（cooldown にも数えない）。
 
 ```bash
-xattr -dr com.apple.quarantine .    # このディレクトリ配下から削除
+xattr -d com.apple.quarantine app-respawn app-respawn-log.command   # 何も表示されなければ成功
 ```
 
-`.git/objects` は read-only なので `Permission denied` で失敗するが、git object は実行されないため
-放置してよい。`~/Downloads` など出所の混ざる場所に同じ操作をしないこと。
+片方にしか付いていない場合、付いていない方には `No such xattr` と出るが問題ない。
+
+Gatekeeper の検査を受けるのは `open` で開く `app-respawn-log.command` だけで、他のファイルは
+ruby や bash から直接実行されるので外さなくても動く。ディレクトリごと `xattr -dr` で外すと、
+read-only の `.git/objects` で `Permission denied` が大量に出て成否が分かりにくくなるので、
+ファイルを名指しして外す。
 
 ### 設置後の確認
 
