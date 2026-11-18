@@ -5,3 +5,4 @@ app-respawn.json
 
 # setup がビルドする app-respawn-launcher
 build/
+.idea/
