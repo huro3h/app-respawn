@@ -1,8 +1,7 @@
 # 手元の環境に固有のアプリ構成。app-respawn.example.json を雛形として使う
 app-respawn.json
-
-.DS_Store
-
 # setup がビルドする app-respawn-launcher
 build/
+
+.DS_Store
 .idea/
