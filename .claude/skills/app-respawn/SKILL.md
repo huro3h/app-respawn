@@ -205,15 +205,30 @@ LaunchAgent には `--max-spaces 3` を渡してある。
 
 > [!NOTE]
 > 各デスクトップのタイルは **`AXRemoveDesktop` アクション**を持っている。サムネイルに
-> ホバーして「×」の座標をクリックする、といった再現は不要。UI 階層は:
+> ホバーして「×」の座標をクリックする、といった再現は不要。UI 階層は macOS 27 で変わった:
 > ```
+> macOS 27 以降(27.2.1 で確認)
+> process "WindowManager"   ← 閉じている間は子が 0 件
+>   └ AXGroup i             ← ディスプレイごと
+>       ├ AXButton ...      ← 各ウィンドウ(数が変わるのでスペースバーの位置も変わる)
+>       └ AXGroup "操作スペースバー"
+>             ├ list 1      ← 子要素が各デスクトップのタイル
+>             └ AXButton    ← デスクトップを追加
+>
+> macOS 26 まで
 > process "Dock" → group 1 ("Mission Control")
 >   └ UI element i          ← ディスプレイごと
 >       ├ [1] AXGroup "Exposéウインドウ"
 >       └ [2] AXGroup "スペースバー"
->             ├ list 1      ← 子要素が各デスクトップのタイル
+>             ├ list 1
 >             └ AXButton "デスクトップを追加"
 > ```
+> 27 では `process "Dock"` の `count of groups` が開いていても 0 のままで、旧コードは
+> 「6秒待っても開きませんでした」で毎回スキップしていた(アクセシビリティの許可は OK のまま
+> なので、許可の問題に見えるが違う)。`SPACE_LISTS_HANDLER` が WindowManager を優先して探し、
+> 見つからなければ Dock を見る。スペースバーは名前(ローカライズ依存)ではなく、
+> 「`AXRemoveDesktop` を持つタイルの list を含む group」で特定する。開閉の判定も同じハンドラで
+> 「スペースバーが1つ以上見つかるか」で行う。
 
 > [!CAUTION]
 > **フルスクリーンのタイルも `AXRemoveDesktop` を持つ。** アクションの有無では判別できない。
@@ -242,7 +257,7 @@ LaunchAgent には `--max-spaces 3` を渡してある。
 > [!IMPORTANT]
 > **Mission Control の開閉はトグル。** 既に開いている状態で `open -a "Mission Control"` を
 > 投げると閉じてしまい、直後の `group 1` 参照が `-1719` で落ちる。開く前に必ず
-> `count of groups` で状態を見る。エラー経路でも必ず閉じること（`ensure`）。
+> `mission_control_state` で状態を見る。エラー経路でも必ず閉じること（`ensure`）。
 
 > [!CAUTION]
 > **操作間隔を詰めると画面が固まる。** 0.4秒間隔かつ削除のたびに開き直す実装で、
