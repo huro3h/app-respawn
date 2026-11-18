@@ -10,6 +10,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- macOS 27 で `--max-spaces` が効かず、外部モニターを外しても操作スペースが減らなかった。Mission Control の UI が `Dock` から `WindowManager` プロセスへ移り、開いたことを検知できずに「Mission Control を開けませんでした」で毎回スキップしていた。`WindowManager` を優先して探し、見つからなければ従来の `Dock` を見るようにした。
+
 ## [1.2.0] - 2026-11-10
 
 ### Added
