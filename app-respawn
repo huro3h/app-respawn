@@ -287,11 +287,54 @@ rescue JSON::ParserError
   nil
 end
 
+# ディスプレイごとのスペースバーの list(子要素が各タイル)を返す AppleScript ハンドラ。
+# 空なら Mission Control は閉じている。各スクリプトの先頭に連結して使う。
+#
+# Mission Control の UI は macOS 27 で process "Dock" から "WindowManager" へ移った。
+# 新しい階層はディスプレイの group が直下に並び、その中のスペースバーの位置はウィンドウの
+# 数で変わる。名前("操作スペースバー")はローカライズ依存なので、AXRemoveDesktop を持つ
+# タイルの list を含む group を探す(ステージマネージャの group を拾わないための条件でもある)。
+# 旧 OS 向けに Dock 側も残す。
+SPACE_LISTS_HANDLER = <<~APPLESCRIPT
+  on spaceLists()
+    tell application "System Events"
+      set res to {}
+      if exists process "WindowManager" then
+        tell process "WindowManager"
+          repeat with g in groups
+            repeat with sb in groups of g
+              if (count of lists of sb) > 0 then
+                set lst to list 1 of sb
+                if (count of UI elements of lst) > 0 then
+                  if (name of actions of (UI element 1 of lst)) contains "AXRemoveDesktop" then
+                    set end of res to lst
+                    exit repeat
+                  end if
+                end if
+              end if
+            end repeat
+          end repeat
+        end tell
+      end if
+      if res is {} then
+        tell process "Dock"
+          if (count of groups) > 0 then
+            repeat with d in UI elements of group 1
+              set end of res to list 1 of UI element 2 of d
+            end repeat
+          end if
+        end tell
+      end if
+      return res
+    end tell
+  end spaceLists
+APPLESCRIPT
+
 # [開いているか, エラー]。AppleScript 自体が失敗した時は nil を返し、「閉じている」と区別する。
 # UI スクリプティングは自動化(Apple Event)とは別に「アクセシビリティ」の許可が要る。
 # しかも launchd 配下では許可の主体が osascript 自身になるので、ここだけ落ちることがある。
 def mission_control_state
-  out, err, ok = osascript('tell application "System Events" to tell process "Dock" to return (count of groups)')
+  out, err, ok = osascript("#{SPACE_LISTS_HANDLER}\nreturn (count of my spaceLists())")
   ok ? [out.to_i.positive?, nil] : [nil, utf8(err).strip]
 end
 
@@ -320,23 +363,22 @@ def close_mission_control
 end
 
 TILE_NAMES_SCRIPT = <<~APPLESCRIPT
+  #{SPACE_LISTS_HANDLER}
+  set lsts to my spaceLists()
   tell application "System Events"
-    tell process "Dock"
-      set out to ""
-      set disps to UI elements of group 1
-      repeat with i from 1 to count of disps
-        set acc to ""
-        repeat with t in UI elements of (list 1 of UI element 2 of (item i of disps))
-          set nm to ""
-          try
-            set nm to (name of t) as text
-          end try
-          set acc to acc & nm & tab
-        end repeat
-        set out to out & acc & linefeed
+    set out to ""
+    repeat with lst in lsts
+      set acc to ""
+      repeat with t in UI elements of lst
+        set nm to ""
+        try
+          set nm to (name of t) as text
+        end try
+        set acc to acc & nm & tab
       end repeat
-      return out
-    end tell
+      set out to out & acc & linefeed
+    end repeat
+    return out
   end tell
 APPLESCRIPT
 
@@ -354,26 +396,25 @@ end
 # 古い値が返る(UI が 2枚を示している時点でファイルは 4枚のままだった)。
 def remove_space_tile(display_no, tile_no, expected_name)
   script = <<~APPLESCRIPT
+    #{SPACE_LISTS_HANDLER}
+    set lst to item #{display_no} of my spaceLists()
     tell application "System Events"
-      tell process "Dock"
-        set lst to list 1 of UI element 2 of (UI element #{display_no} of group 1)
-        set t to UI element #{tile_no} of lst
-        set nm to ""
-        try
-          set nm to (name of t) as text
-        end try
-        if nm is not "#{expected_name}" then return "MISMATCH," & nm
-        set n0 to count of UI elements of lst
-        perform action "AXRemoveDesktop" of t
-        set n1 to n0
-        repeat #{(SPACE_REMOVE_TIMEOUT / SPACE_POLL_INTERVAL).round} times
-          delay #{SPACE_POLL_INTERVAL}
-          set n1 to count of UI elements of lst
-          if n1 is not n0 then exit repeat
-        end repeat
-        delay #{SPACE_REMOVE_SETTLE}
-        return (n0 as text) & "," & (n1 as text)
-      end tell
+      set t to UI element #{tile_no} of lst
+      set nm to ""
+      try
+        set nm to (name of t) as text
+      end try
+      if nm is not "#{expected_name}" then return "MISMATCH," & nm
+      set n0 to count of UI elements of lst
+      perform action "AXRemoveDesktop" of t
+      set n1 to n0
+      repeat #{(SPACE_REMOVE_TIMEOUT / SPACE_POLL_INTERVAL).round} times
+        delay #{SPACE_POLL_INTERVAL}
+        set n1 to count of UI elements of lst
+        if n1 is not n0 then exit repeat
+      end repeat
+      delay #{SPACE_REMOVE_SETTLE}
+      return (n0 as text) & "," & (n1 as text)
     end tell
   APPLESCRIPT
 
